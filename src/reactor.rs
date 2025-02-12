@@ -1,7 +1,10 @@
 use std::{
     cell::RefCell,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+    },
     task::Waker,
     time::Duration,
 };
@@ -14,20 +17,6 @@ use rustix::{
         TimerfdTimerFlags, Timespec,
     },
 };
-
-pub struct Reactor<N, T> {
-    notifier: Arc<N>,
-    timeout: T,
-    inner: RefCell<Inner>,
-}
-
-// The part of reactor that requires interior mutability
-#[derive(Default)]
-struct Inner {
-    // All the pollfds will be constructed from raw fds, so don't worry about lifetimes
-    pollfds: Vec<PollFd<'static>>,
-    wakers: Vec<Waker>,
-}
 
 pub struct Interest {
     read: bool,
@@ -70,9 +59,23 @@ impl From<Interest> for PollFlags {
     }
 }
 
+pub struct Reactor<N: Notifier, T: Timeout> {
+    notifier: Arc<FlagNotifier<N>>,
+    timeout: T,
+    inner: RefCell<Inner>,
+}
+
+// The part of reactor that requires interior mutability
+#[derive(Default)]
+struct Inner {
+    // All the pollfds will be constructed from raw fds, so don't worry about lifetimes
+    pollfds: Vec<PollFd<'static>>,
+    wakers: Vec<Waker>,
+}
+
 impl<N: Notifier, T: Timeout> Reactor<N, T> {
     fn new() -> io::Result<Self> {
-        let notifier = Arc::new(Notifier::new()?);
+        let notifier = Arc::new(FlagNotifier::new(Notifier::new()?));
         let timeout = Timeout::new()?;
         let inner = Inner::default();
         Ok(Self {
@@ -106,7 +109,7 @@ impl<N: Notifier, T: Timeout> Reactor<N, T> {
         let timeout = self.timeout.set_timeout(timeout)?;
         // SAFETY: pollfds will be cleared by the end of the call
         unsafe {
-            self.notifier.register(&mut inner.0.pollfds);
+            self.notifier.inner.register(&mut inner.0.pollfds);
             self.timeout.register(&mut inner.0.pollfds);
         }
 
@@ -122,6 +125,11 @@ impl<N: Notifier, T: Timeout> Reactor<N, T> {
                     == n => {}
 
             _ => {
+                // Now that we have awaken from the poll call, there's no need to send any
+                // notifications to "wake up" from the poll, so we set the notified flag to prevent
+                // our wakers from sending any notifications.
+                self.notifier.set_to_notified();
+                // For every FD that received an event, invoke its waker
                 for (pollfd, waker) in inner.0.pollfds.iter().zip(&inner.0.wakers) {
                     if pollfd.revents().intersects(
                         PollFlags::IN
@@ -140,7 +148,7 @@ impl<N: Notifier, T: Timeout> Reactor<N, T> {
         Ok(())
     }
 
-    fn notifier(&self) -> Weak<N> {
+    fn notifier(&self) -> Weak<FlagNotifier<N>> {
         Arc::downgrade(&self.notifier)
     }
 }
@@ -179,6 +187,46 @@ impl Notifier for EventFd {
             BorrowedFd::borrow_raw(self.fd.as_raw_fd()),
             PollFlags::IN,
         ));
+    }
+}
+
+struct FlagNotifier<N: Notifier> {
+    inner: N,
+    is_notified: AtomicBool,
+}
+
+impl<N: Notifier> FlagNotifier<N> {
+    fn new(inner: N) -> Self {
+        Self {
+            inner,
+            is_notified: AtomicBool::new(false),
+        }
+    }
+
+    fn notify(&self) -> io::Result<()> {
+        // Use atomic flag to ensure that the inner notifier will only be called once even with
+        // multiple notify() calls. Acquire memory order is used to ensure operations on the inner
+        // notifier happen after checking the atomic flag.
+        if self
+            .is_notified
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.inner.notify()?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        let res = self.inner.clear();
+        // Release memory ordering is used to ensure the inner notifier is cleared before clearing
+        // the atomic flag.
+        self.is_notified.store(false, Ordering::Release);
+        res
+    }
+
+    fn set_to_notified(&self) {
+        self.is_notified.store(true, Ordering::Relaxed);
     }
 }
 
@@ -273,6 +321,8 @@ mod tests {
         time::Instant,
     };
 
+    use rustix::io::read;
+
     use super::*;
 
     macro_rules! assert_reactor_wait {
@@ -290,12 +340,12 @@ mod tests {
         let reactor = Reactor::<EventFd, PollTimeout>::new().unwrap();
         let notifier = reactor.notifier();
 
-        let handle = std::thread::spawn(move || {
-            assert_reactor_wait!(reactor, None).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                assert_reactor_wait!(reactor, None).unwrap();
+            });
+            notifier.upgrade().unwrap().notify().unwrap();
         });
-
-        notifier.upgrade().unwrap().notify().unwrap();
-        handle.join().unwrap();
     }
 
     #[test]
@@ -381,5 +431,23 @@ mod tests {
 
         assert!(!wakers[2].0.load(Ordering::Relaxed));
         assert!(!wakers[3].0.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn flag_notifier() {
+        let notifier = FlagNotifier::new(EventFd::new().unwrap());
+
+        // Send 10 notifications simultaneously
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                s.spawn(|| notifier.notify());
+            }
+        });
+
+        let mut eventfd_value = [0u8; 8];
+        read(&notifier.inner.fd, &mut eventfd_value).unwrap();
+        // The inner eventfd should have only been written once
+        assert_eq!(u64::from_ne_bytes(eventfd_value), 1);
+        assert!(notifier.is_notified.load(Ordering::Relaxed));
     }
 }
