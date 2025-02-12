@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    sync::{Arc, Weak},
     task::Waker,
     time::Duration,
 };
@@ -14,8 +15,8 @@ use rustix::{
     },
 };
 
-pub struct Reactor<N: Notifier, T: Timeout> {
-    notifier: N,
+pub struct Reactor<N, T> {
+    notifier: Arc<N>,
     timeout: T,
     inner: RefCell<Inner>,
 }
@@ -33,6 +34,29 @@ pub struct Interest {
     write: bool,
 }
 
+impl Interest {
+    pub fn read() -> Self {
+        Self {
+            read: true,
+            write: false,
+        }
+    }
+
+    pub fn write() -> Self {
+        Self {
+            read: false,
+            write: true,
+        }
+    }
+
+    pub fn both() -> Self {
+        Self {
+            read: true,
+            write: true,
+        }
+    }
+}
+
 impl From<Interest> for PollFlags {
     fn from(val: Interest) -> Self {
         let mut flags = PollFlags::empty();
@@ -48,7 +72,7 @@ impl From<Interest> for PollFlags {
 
 impl<N: Notifier, T: Timeout> Reactor<N, T> {
     fn new() -> io::Result<Self> {
-        let notifier = Notifier::new()?;
+        let notifier = Arc::new(Notifier::new()?);
         let timeout = Timeout::new()?;
         let inner = Inner::default();
         Ok(Self {
@@ -116,8 +140,8 @@ impl<N: Notifier, T: Timeout> Reactor<N, T> {
         Ok(())
     }
 
-    fn notify(&self) -> io::Result<()> {
-        self.notifier.notify()
+    fn notifier(&self) -> Weak<N> {
+        Arc::downgrade(&self.notifier)
     }
 }
 
@@ -131,28 +155,28 @@ trait Notifier {
 }
 
 struct EventFd {
-    eventfd: OwnedFd,
+    fd: OwnedFd,
 }
 
 impl Notifier for EventFd {
     fn new() -> io::Result<Self> {
         let eventfd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
-        Ok(Self { eventfd })
+        Ok(Self { fd: eventfd })
     }
 
     fn clear(&self) -> io::Result<()> {
         // Sets eventfd to 0
-        io::read(&self.eventfd, &mut [0u8; 8]).map(drop)
+        io::read(&self.fd, &mut [0u8; 8]).map(drop)
     }
 
     fn notify(&self) -> io::Result<()> {
         // Eventfd should write all 8 bytes in a single call
-        io::write(&self.eventfd, &1u64.to_ne_bytes()).map(drop)
+        io::write(&self.fd, &1u64.to_ne_bytes()).map(drop)
     }
 
     unsafe fn register(&self, pollfds: &mut Vec<PollFd<'static>>) {
         pollfds.push(PollFd::from_borrowed_fd(
-            BorrowedFd::borrow_raw(self.eventfd.as_raw_fd()),
+            BorrowedFd::borrow_raw(self.fd.as_raw_fd()),
             PollFlags::IN,
         ));
     }
@@ -225,7 +249,7 @@ impl Timeout for TimerFd {
                 // If duration is 0, then the timespec needs to be at least 1 nanosecond, since
                 // setting timespec to 0 disarms the timerfd
                 tv_nsec: duration
-                    .map(|d| d.subsec_nanos().min(1).into())
+                    .map(|d| d.subsec_nanos().max(1).into())
                     .unwrap_or(0),
             },
         };
@@ -238,5 +262,124 @@ impl Timeout for TimerFd {
             BorrowedFd::borrow_raw(self.fd.as_raw_fd()),
             PollFlags::IN,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        task::Wake,
+        time::Instant,
+    };
+
+    use super::*;
+
+    macro_rules! assert_reactor_wait {
+        ($reactor:ident, $timeout:expr) => {{
+            let res = $reactor.wait($timeout);
+            let inner = $reactor.inner.borrow();
+            assert!(inner.pollfds.is_empty());
+            assert!(inner.wakers.is_empty());
+            res
+        }};
+    }
+
+    #[test]
+    fn only_eventfd() {
+        let reactor = Reactor::<EventFd, PollTimeout>::new().unwrap();
+        let notifier = reactor.notifier();
+
+        let handle = std::thread::spawn(move || {
+            assert_reactor_wait!(reactor, None).unwrap();
+        });
+
+        notifier.upgrade().unwrap().notify().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn poll_timeout() {
+        let reactor = Reactor::<EventFd, PollTimeout>::new().unwrap();
+        assert_reactor_wait!(reactor, Some(Duration::from_millis(0))).unwrap();
+
+        let start = Instant::now();
+        assert_reactor_wait!(reactor, Some(Duration::from_millis(10))).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(10));
+
+        let start = Instant::now();
+        assert_reactor_wait!(reactor, Some(Duration::from_nanos(10))).unwrap();
+        // Expect time to round up to nearest millisecond
+        assert!(start.elapsed() >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn timerfd_timeout() {
+        let reactor = Reactor::<EventFd, TimerFd>::new().unwrap();
+        assert_reactor_wait!(reactor, Some(Duration::from_millis(0))).unwrap();
+
+        let start = Instant::now();
+        assert_reactor_wait!(reactor, Some(Duration::from_millis(10))).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(10));
+
+        let start = Instant::now();
+        assert_reactor_wait!(reactor, Some(Duration::from_nanos(10))).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_nanos(10) && elapsed < Duration::from_millis(1));
+    }
+
+    #[derive(Default)]
+    struct MockWaker(AtomicBool);
+    impl Wake for MockWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn multiple_events() {
+        const COUNT: usize = 5;
+        let reactor = Reactor::<EventFd, PollTimeout>::new().unwrap();
+        let events: Vec<_> = (0..COUNT).map(|_| EventFd::new().unwrap()).collect();
+        let wakers: Vec<_> = (0..COUNT).map(|_| Arc::new(MockWaker::default())).collect();
+
+        // Register 5 events and their respective wakers
+        for (ev, wk) in events.iter().zip(&wakers) {
+            unsafe { reactor.register(&ev.fd, Interest::read(), wk.clone().into()) };
+        }
+
+        events[0].notify().unwrap();
+        events[2].notify().unwrap();
+        events[4].notify().unwrap();
+        assert_reactor_wait!(reactor, None).unwrap();
+
+        for (i, wk) in wakers.iter().enumerate() {
+            let awoken = wk.0.load(Ordering::Relaxed);
+            match i {
+                0 | 2 | 4 => assert!(awoken),
+                _ => assert!(!awoken),
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_wakes() {
+        const COUNT: usize = 5;
+        let reactor = Reactor::<EventFd, PollTimeout>::new().unwrap();
+        let events: Vec<_> = (0..COUNT).map(|_| EventFd::new().unwrap()).collect();
+        let wakers: Vec<_> = (0..COUNT).map(|_| Arc::new(MockWaker::default())).collect();
+
+        for i in [0, 1, 4] {
+            // Register 5 events and their respective wakers
+            for (ev, wk) in events.iter().zip(&wakers) {
+                unsafe { reactor.register(&ev.fd, Interest::read(), wk.clone().into()) };
+            }
+            events[i].notify().unwrap();
+            assert_reactor_wait!(reactor, None).unwrap();
+            assert!(wakers[i].0.load(Ordering::Relaxed));
+        }
+
+        assert!(!wakers[2].0.load(Ordering::Relaxed));
+        assert!(!wakers[3].0.load(Ordering::Relaxed));
     }
 }
