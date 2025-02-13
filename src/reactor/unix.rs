@@ -12,6 +12,7 @@ use std::{
 
 use rustix::{
     event::{eventfd, poll, EventfdFlags, PollFd, PollFlags},
+    pipe::{pipe_with, PipeFlags},
     time::{
         timerfd_create, timerfd_settime, Itimerspec, TimerfdClockId, TimerfdFlags,
         TimerfdTimerFlags, Timespec,
@@ -172,6 +173,44 @@ impl NotifierFd for EventFd {
     }
 }
 
+/// Unix pipe for notifying the reactor on non-Linux platforms
+pub struct PipeFd {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl NotifierFd for PipeFd {
+    fn new() -> io::Result<Self>
+    where
+        Self: Sized,
+    {
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+        Ok(Self { read, write })
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        // Ideally we want to clear every notification, but each notification requires one byte of
+        // memory to read out. Since this pipe will be wrapped in a `FlagNotifier`, there shouldn't
+        // be more than one notification written at a time, so reading 8 bytes should suffice.
+        rustix::io::read(&self.read, &mut [0u8; 8])?;
+        Ok(())
+    }
+
+    fn notify(&self) -> io::Result<()> {
+        // Write one byte to the pipe
+        rustix::io::write(&self.write, &[0])?;
+        Ok(())
+    }
+
+    unsafe fn register(&self, pollfds: &mut Vec<PollFd<'static>>) {
+        // Register the read end of the pipe
+        pollfds.push(PollFd::from_borrowed_fd(
+            BorrowedFd::borrow_raw(self.read.as_raw_fd()),
+            PollFlags::IN,
+        ));
+    }
+}
+
 /// Wraps a `NotifierFd` implementation with an atomic flag so that the notification is only sent
 /// once to the FD.
 struct FlagNotifier<N: NotifierFd> {
@@ -303,8 +342,12 @@ impl Timeout for TimerFd {
     }
 }
 
+// On Linux platforms, use eventfd for notification and timerfd for timeouts
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub type UnixReactor = PollReactor<EventFd, TimerFd>;
+// On non-Linux platforms, use pipe for notification and the poll() argument for timeouts
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub type UnixReactor = PollReactor<PipeFd, PollTimeout>;
 
 #[cfg(test)]
 mod tests {
@@ -330,16 +373,41 @@ mod tests {
     }
 
     #[test]
-    fn only_eventfd() {
+    fn eventfd_notification() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
         let notifier = reactor.notifier();
 
         std::thread::scope(|s| {
             s.spawn(move || {
-                assert_reactor_wait!(reactor, None).unwrap();
+                // Make sure the notification is sent after the reactor starts waiting
+                std::thread::sleep(Duration::from_millis(10));
+                notifier.upgrade().unwrap().notify().unwrap();
             });
-            notifier.upgrade().unwrap().notify().unwrap();
+            assert_reactor_wait!(reactor, None).unwrap();
         });
+
+        // Now send notification before reactor starts waiting
+        reactor.notifier().upgrade().unwrap().notify().unwrap();
+        assert_reactor_wait!(reactor, None).unwrap();
+    }
+
+    #[test]
+    fn pipe_notification() {
+        let reactor = PollReactor::<PipeFd, PollTimeout>::new().unwrap();
+        let notifier = reactor.notifier();
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // Make sure the notification is sent after the reactor starts waiting
+                std::thread::sleep(Duration::from_millis(10));
+                notifier.upgrade().unwrap().notify().unwrap();
+            });
+            assert_reactor_wait!(reactor, None).unwrap();
+        });
+
+        // Now send notification before reactor starts waiting
+        reactor.notifier().upgrade().unwrap().notify().unwrap();
+        assert_reactor_wait!(reactor, None).unwrap();
     }
 
     #[test]
