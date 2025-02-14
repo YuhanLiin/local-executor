@@ -33,6 +33,8 @@ impl Interest {
 
 /// General trait for the reactor used to wakeup futures
 pub trait Reactor {
+    type Notifier: Notifier + 'static;
+
     /// Construct new reactor
     fn new() -> io::Result<Self>
     where
@@ -52,11 +54,11 @@ pub trait Reactor {
     fn wait(&self, timeout: Option<Duration>) -> io::Result<()>;
 
     /// Return a handle to a notifier object that can be used to wake up the reactor.
-    fn notifier(&self) -> Weak<impl Notifier>;
+    fn notifier(&self) -> Weak<Self::Notifier>;
 }
 
 /// Object that wakes up the reactor
-pub trait Notifier: 'static {
+pub trait Notifier {
     fn notify(&self) -> io::Result<()>;
 }
 
@@ -64,3 +66,5 @@ pub trait Notifier: 'static {
 mod unix;
 #[cfg(unix)]
 pub type ReactorImpl = unix::UnixReactor;
+
+pub type NotifierImpl = <ReactorImpl as Reactor>::Notifier;

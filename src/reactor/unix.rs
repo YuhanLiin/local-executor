@@ -50,6 +50,8 @@ struct Inner {
 }
 
 impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
+    type Notifier = FlagNotifier<N>;
+
     fn new() -> io::Result<Self> {
         let notifier = Arc::new(FlagNotifier::new(NotifierFd::new()?));
         let timeout = Timeout::new()?;
@@ -125,7 +127,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         Ok(())
     }
 
-    fn notifier(&self) -> Weak<impl Notifier> {
+    fn notifier(&self) -> Weak<Self::Notifier> {
         Arc::downgrade(&self.notifier)
     }
 }
@@ -213,7 +215,7 @@ impl NotifierFd for PipeFd {
 
 /// Wraps a `NotifierFd` implementation with an atomic flag so that the notification is only sent
 /// once to the FD.
-struct FlagNotifier<N: NotifierFd> {
+pub struct FlagNotifier<N: NotifierFd> {
     inner: N,
     is_notified: AtomicBool,
 }
