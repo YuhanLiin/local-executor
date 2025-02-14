@@ -3,12 +3,31 @@ mod reactor;
 use std::{
     cell::LazyCell,
     future::Future,
+    num::NonZero,
     pin::pin,
     sync::Weak,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 use reactor::{Notifier, NotifierImpl, Reactor, ReactorImpl};
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
+struct Id(NonZero<usize>);
+
+impl Id {
+    const fn new(n: usize) -> Self {
+        Id(NonZero::new(n).expect("expected non-zero ID"))
+    }
+
+    const fn overflowing_incr(&self) -> Self {
+        // Wrap back around to 1 on overflow
+        match self.0.checked_add(1) {
+            Some(next) => Self(next),
+            None => const { Id::new(1) },
+        }
+    }
+}
 
 thread_local! {
     static REACTOR: LazyCell<ReactorImpl> = LazyCell::new(|| ReactorImpl::new().expect("Failed to initialize reactor"));

@@ -2,7 +2,10 @@
 use std::os::fd::AsRawFd;
 use std::{io, sync::Weak, task::Waker, time::Duration};
 
+use crate::Id;
+
 /// Type of events that we're interested in receiving
+#[derive(Debug, Clone, Copy)]
 pub struct Interest {
     pub read: bool,
     pub write: bool,
@@ -41,12 +44,21 @@ pub trait Reactor {
         Self: Sized;
 
     /// Register new event source onto the reactor along with a Waker that will be pinged if an
-    /// event is received on the source.
+    /// event is received on the source. Returns an unique ID to that event source.
     ///
-    /// SAFETY: The event source must not be dropped before its FD is cleared from the reactor via
-    /// `wait()`.
+    /// SAFETY: The event source must not be dropped before it's cleared from the reactor via
+    /// `deregister()`.
     #[cfg(unix)]
-    unsafe fn register<S: AsRawFd>(&self, source: &S, interest: Interest, waker: Waker);
+    unsafe fn register<S: AsRawFd>(&self, source: &S, interest: Interest, waker: Waker) -> Id;
+
+    /// Deregister event source from the reactor
+    #[cfg(unix)]
+    fn deregister<S: AsRawFd>(&self, id: Id, source: &S);
+
+    #[cfg(unix)]
+    /// Change the interested events and waker associated with a registered event source.
+    fn modify<S: AsRawFd>(&self, id: Id, source: &S, interest: Interest, waker: &Waker);
+
     #[cfg(not(unix))]
     compile_error!("Unsupported operating system!");
 
