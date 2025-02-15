@@ -50,6 +50,14 @@ struct Inner {
     event_sources: BTreeMap<(Id, RawFd), (Interest, Waker)>,
 }
 
+impl Inner {
+    fn clear(&mut self) {
+        self.pollfds.clear();
+        self.ids.clear();
+        self.event_sources.clear();
+    }
+}
+
 impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
     type Notifier = FlagNotifier<N>;
 
@@ -183,6 +191,10 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
 
     fn notifier(&self) -> Weak<Self::Notifier> {
         Arc::downgrade(&self.notifier)
+    }
+
+    fn clear_notifications(&self) {
+        let _ = self.notifier.clear();
     }
 }
 
