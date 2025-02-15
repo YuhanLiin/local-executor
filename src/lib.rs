@@ -12,6 +12,7 @@ use std::{
 };
 
 use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
+use timer::TIMER_QUEUE;
 
 // Option<Id> will be same size as `usize`
 #[repr(transparent)]
@@ -78,7 +79,8 @@ where
             return out;
         }
 
-        // TODO use proper timeouts
-        REACTOR.with(|r| r.wait(None)).expect("Reactor wait failed");
+        REACTOR
+            .with(|r| r.wait(TIMER_QUEUE.with(|q| q.next_timeout())))
+            .expect("Reactor wait failed");
     }
 }
