@@ -38,7 +38,7 @@ impl From<Interest> for PollFlags {
 }
 
 /// Reactor that uses `poll()` to wait for events, making it compatible on all Unix platforms.
-pub struct PollReactor<N: NotifierFd, T: Timeout> {
+pub(crate) struct PollReactor<N: NotifierFd, T: Timeout> {
     current_id: Cell<Id>,
     inner: RefCell<Inner>,
     notifier: Arc<FlagNotifier<N>>,
@@ -191,7 +191,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
 }
 
 /// Method of notifying the reactor to wake it up
-pub trait NotifierFd: 'static {
+pub(crate) trait NotifierFd: 'static {
     fn new() -> io::Result<Self>
     where
         Self: Sized;
@@ -202,7 +202,7 @@ pub trait NotifierFd: 'static {
 
 /// Linux eventfd for notifying the reactor
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub struct EventFd {
+pub(crate) struct EventFd {
     fd: OwnedFd,
 }
 
@@ -234,7 +234,7 @@ impl NotifierFd for EventFd {
 }
 
 /// Unix pipe for notifying the reactor on non-Linux platforms
-pub struct PipeFd {
+pub(crate) struct PipeFd {
     read: OwnedFd,
     write: OwnedFd,
 }
@@ -273,7 +273,7 @@ impl NotifierFd for PipeFd {
 
 /// Wraps a `NotifierFd` implementation with an atomic flag so that the notification is only sent
 /// once to the FD.
-pub struct FlagNotifier<N: NotifierFd> {
+pub(crate) struct FlagNotifier<N: NotifierFd> {
     inner: N,
     is_notified: AtomicBool,
 }
@@ -316,7 +316,7 @@ impl<N: NotifierFd> Notifier for FlagNotifier<N> {
 }
 
 /// Method of handling timeouts on the reactor
-pub trait Timeout {
+pub(crate) trait Timeout {
     fn new() -> io::Result<Self>
     where
         Self: Sized;
@@ -356,7 +356,7 @@ impl Timeout for PollTimeout {
 
 /// Linux timerfd that can handle timeouts of nanosecond precision
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub struct TimerFd {
+pub(crate) struct TimerFd {
     fd: OwnedFd,
 }
 
@@ -404,23 +404,22 @@ impl Timeout for TimerFd {
 
 // On Linux platforms, use eventfd for notification and timerfd for timeouts
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub type UnixReactor = PollReactor<EventFd, TimerFd>;
+pub(crate) type UnixReactor = PollReactor<EventFd, TimerFd>;
 // On non-Linux platforms, use pipe for notification and the poll() argument for timeouts
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub type UnixReactor = PollReactor<PipeFd, PollTimeout>;
+pub(crate) type UnixReactor = PollReactor<PipeFd, PollTimeout>;
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::atomic::{AtomicBool, Ordering},
-        task::Wake,
-        time::Instant,
-    };
+    use std::{sync::atomic::Ordering, time::Instant};
 
     use rustix::io::read;
 
     use super::*;
-    use crate::reactor::{Notifier, Reactor};
+    use crate::{
+        reactor::{Notifier, Reactor},
+        test::MockWaker,
+    };
 
     macro_rules! assert_reactor_wait {
         ($reactor:ident, $timeout:expr) => {{
@@ -500,14 +499,6 @@ mod tests {
         assert!(elapsed >= Duration::from_nanos(10) && elapsed < Duration::from_millis(1));
     }
 
-    #[derive(Default)]
-    struct MockWaker(AtomicBool);
-    impl Wake for MockWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-
     #[test]
     fn multiple_events() {
         const COUNT: usize = 5;
@@ -526,7 +517,7 @@ mod tests {
         assert_reactor_wait!(reactor, None).unwrap();
 
         for (i, wk) in wakers.iter().enumerate() {
-            let awoken = wk.0.load(Ordering::Relaxed);
+            let awoken = wk.get();
             match i {
                 0 | 2 | 4 => assert!(awoken),
                 _ => assert!(!awoken),
@@ -549,11 +540,11 @@ mod tests {
         for i in [0, 1, 4] {
             events[i].notify().unwrap();
             assert_reactor_wait!(reactor, None).unwrap();
-            assert!(wakers[i].0.load(Ordering::Relaxed));
+            assert!(wakers[i].get());
         }
 
-        assert!(!wakers[2].0.load(Ordering::Relaxed));
-        assert!(!wakers[3].0.load(Ordering::Relaxed));
+        assert!(!wakers[2].get());
+        assert!(!wakers[3].get());
     }
 
     #[test]
@@ -565,16 +556,16 @@ mod tests {
         let id = unsafe { reactor.register(&event.fd, Interest::read(), wakers[0].clone().into()) };
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
-        assert!(wakers[0].0.load(Ordering::Relaxed));
+        assert!(wakers[0].get());
 
         reactor.modify(id, &event.fd, Interest::read(), &wakers[1].clone().into());
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
-        assert!(wakers[1].0.load(Ordering::Relaxed));
+        assert!(wakers[1].get());
 
         reactor.modify(id, &event.fd, Interest::write(), &wakers[2].clone().into());
         assert_reactor_wait!(reactor, None).unwrap();
-        assert!(wakers[2].0.load(Ordering::Relaxed));
+        assert!(wakers[2].get());
 
         reactor.deregister(id, &event.fd);
         assert!(reactor.inner.borrow().event_sources.is_empty());
@@ -595,21 +586,21 @@ mod tests {
 
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
-        assert!(wakers[0].0.load(Ordering::Relaxed));
-        assert!(wakers[1].0.load(Ordering::Relaxed));
-        assert!(wakers[2].0.load(Ordering::Relaxed));
+        assert!(wakers[0].get());
+        assert!(wakers[1].get());
+        assert!(wakers[2].get());
 
         for wk in &wakers {
-            wk.0.store(false, Ordering::Relaxed);
+            wk.set(false);
         }
         reactor.deregister(id1, &event.fd);
         reactor.deregister(id2, &event.fd);
 
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
-        assert!(!wakers[0].0.load(Ordering::Relaxed));
-        assert!(!wakers[1].0.load(Ordering::Relaxed));
-        assert!(wakers[2].0.load(Ordering::Relaxed));
+        assert!(!wakers[0].get());
+        assert!(!wakers[1].get());
+        assert!(wakers[2].get());
     }
 
     #[test]

@@ -6,27 +6,27 @@ use crate::Id;
 
 /// Type of events that we're interested in receiving
 #[derive(Debug, Clone, Copy)]
-pub struct Interest {
-    pub read: bool,
-    pub write: bool,
+pub(crate) struct Interest {
+    pub(crate) read: bool,
+    pub(crate) write: bool,
 }
 
 impl Interest {
-    pub fn read() -> Self {
+    pub(crate) fn read() -> Self {
         Self {
             read: true,
             write: false,
         }
     }
 
-    pub fn write() -> Self {
+    pub(crate) fn write() -> Self {
         Self {
             read: false,
             write: true,
         }
     }
 
-    pub fn both() -> Self {
+    pub(crate) fn both() -> Self {
         Self {
             read: true,
             write: true,
@@ -35,7 +35,7 @@ impl Interest {
 }
 
 /// General trait for the reactor used to wakeup futures
-pub trait Reactor {
+pub(crate) trait Reactor {
     type Notifier: Notifier + 'static;
 
     /// Construct new reactor
@@ -70,17 +70,17 @@ pub trait Reactor {
 }
 
 /// Object that wakes up the reactor
-pub trait Notifier {
+pub(crate) trait Notifier {
     fn notify(&self) -> io::Result<()>;
 }
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub type ReactorImpl = unix::UnixReactor;
+pub(crate) type ReactorImpl = unix::UnixReactor;
 
-pub type NotifierImpl = <ReactorImpl as Reactor>::Notifier;
+pub(crate) type NotifierImpl = <ReactorImpl as Reactor>::Notifier;
 
 thread_local! {
-    pub static REACTOR: ReactorImpl = ReactorImpl::new().expect("Failed to initialize reactor");
+    pub(crate) static REACTOR: ReactorImpl = ReactorImpl::new().expect("Failed to initialize reactor");
 }
