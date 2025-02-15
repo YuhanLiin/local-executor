@@ -26,14 +26,10 @@ use super::{Interest, Notifier, Reactor};
 
 impl From<Interest> for PollFlags {
     fn from(val: Interest) -> Self {
-        let mut flags = PollFlags::empty();
-        if val.read {
-            flags |= PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::PRI;
+        match val {
+            Interest::Read => PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::PRI,
+            Interest::Write => PollFlags::OUT | PollFlags::HUP | PollFlags::ERR,
         }
-        if val.write {
-            flags |= PollFlags::OUT | PollFlags::HUP | PollFlags::ERR;
-        }
-        flags
     }
 }
 

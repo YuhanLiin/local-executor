@@ -4,33 +4,20 @@ use std::{io, sync::Weak, task::Waker, time::Duration};
 
 use crate::Id;
 
-/// Type of events that we're interested in receiving
+/// Type of event that we're interested in receiving
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Interest {
-    pub(crate) read: bool,
-    pub(crate) write: bool,
+pub(crate) enum Interest {
+    Read,
+    Write,
 }
 
 impl Interest {
     pub(crate) fn read() -> Self {
-        Self {
-            read: true,
-            write: false,
-        }
+        Self::Read
     }
 
     pub(crate) fn write() -> Self {
-        Self {
-            read: false,
-            write: true,
-        }
-    }
-
-    pub(crate) fn both() -> Self {
-        Self {
-            read: true,
-            write: true,
-        }
+        Self::Write
     }
 }
 
