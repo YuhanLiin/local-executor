@@ -119,17 +119,18 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
     }
 
     fn wait(&self, timeout: Option<Duration>) -> io::Result<()> {
-        // Drop guard to ensure the pollfds and wakers are always cleared
-        struct DropGuard<'a>(&'a mut Inner);
-        impl Drop for DropGuard<'_> {
+        // Drop guard to ensure the pollfds and notifier are always cleared
+        struct DropGuard<'a, N: NotifierFd>(&'a mut Inner, &'a FlagNotifier<N>);
+        impl<N: NotifierFd> Drop for DropGuard<'_, N> {
             fn drop(&mut self) {
                 self.0.pollfds.clear();
                 self.0.ids.clear();
+                let _ = self.1.clear();
             }
         }
 
         let mut borrow = self.inner.borrow_mut();
-        let inner = DropGuard(&mut borrow);
+        let inner = DropGuard(&mut borrow, self.notifier.as_ref());
         let timeout = self.timeout.set_timeout(timeout)?;
 
         for ((id, fd), (interest, _)) in &inner.0.event_sources {
@@ -180,7 +181,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             }
         };
 
-        let _ = self.notifier.clear();
+        // Notifier and pollfds should get cleared here via the drop guard
         Ok(())
     }
 
@@ -577,6 +578,38 @@ mod tests {
 
         reactor.deregister(id, &event.fd);
         assert!(reactor.inner.borrow().event_sources.is_empty());
+    }
+
+    #[test]
+    fn repeated_source() {
+        let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
+        let event = EventFd::new().unwrap();
+        let wakers: Vec<_> = (0..3).map(|_| Arc::new(MockWaker::default())).collect();
+
+        let id1 =
+            unsafe { reactor.register(&event.fd, Interest::read(), wakers[0].clone().into()) };
+        let id2 =
+            unsafe { reactor.register(&event.fd, Interest::read(), wakers[1].clone().into()) };
+        let id3 =
+            unsafe { reactor.register(&event.fd, Interest::read(), wakers[2].clone().into()) };
+
+        event.notify().unwrap();
+        assert_reactor_wait!(reactor, None).unwrap();
+        assert!(wakers[0].0.load(Ordering::Relaxed));
+        assert!(wakers[1].0.load(Ordering::Relaxed));
+        assert!(wakers[2].0.load(Ordering::Relaxed));
+
+        for wk in &wakers {
+            wk.0.store(false, Ordering::Relaxed);
+        }
+        reactor.deregister(id1, &event.fd);
+        reactor.deregister(id2, &event.fd);
+
+        event.notify().unwrap();
+        assert_reactor_wait!(reactor, None).unwrap();
+        assert!(!wakers[0].0.load(Ordering::Relaxed));
+        assert!(!wakers[1].0.load(Ordering::Relaxed));
+        assert!(wakers[2].0.load(Ordering::Relaxed));
     }
 
     #[test]
