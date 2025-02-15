@@ -80,3 +80,7 @@ mod unix;
 pub type ReactorImpl = unix::UnixReactor;
 
 pub type NotifierImpl = <ReactorImpl as Reactor>::Notifier;
+
+thread_local! {
+    pub static REACTOR: ReactorImpl = ReactorImpl::new().expect("Failed to initialize reactor");
+}

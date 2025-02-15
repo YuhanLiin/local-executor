@@ -590,7 +590,7 @@ mod tests {
             unsafe { reactor.register(&event.fd, Interest::read(), wakers[0].clone().into()) };
         let id2 =
             unsafe { reactor.register(&event.fd, Interest::read(), wakers[1].clone().into()) };
-        let id3 =
+        let _id3 =
             unsafe { reactor.register(&event.fd, Interest::read(), wakers[2].clone().into()) };
 
         event.notify().unwrap();

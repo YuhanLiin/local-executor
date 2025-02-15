@@ -1,7 +1,9 @@
 mod reactor;
+#[cfg(test)]
+mod test;
+pub mod timer;
 
 use std::{
-    cell::LazyCell,
     future::Future,
     num::NonZero,
     pin::pin,
@@ -9,8 +11,9 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use reactor::{Notifier, NotifierImpl, Reactor, ReactorImpl};
+use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
 
+// Option<Id> will be same size as `usize`
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
 struct Id(NonZero<usize>);
@@ -27,10 +30,6 @@ impl Id {
             None => const { Id::new(1) },
         }
     }
-}
-
-thread_local! {
-    static REACTOR: LazyCell<ReactorImpl> = LazyCell::new(|| ReactorImpl::new().expect("Failed to initialize reactor"));
 }
 
 static WAKER_VTABLE: RawWakerVTable =
