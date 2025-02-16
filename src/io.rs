@@ -12,21 +12,13 @@ use std::{
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
-    reactor::{Interest, Source, WakeMode},
-    Id, Reactor, REACTOR,
+    reactor::{EventHandle, Interest},
+    Reactor, REACTOR,
 };
-
-const READ_ID: usize = 0;
-const WRITE_ID: usize = 1;
-
-struct Registration {
-    source: Source,
-    ids: [Option<Id>; 2],
-}
 
 pub struct Async<T> {
     inner: T,
-    reg: Registration,
+    handle: EventHandle,
     _phantom: PhantomData<*const ()>,
 }
 
@@ -35,13 +27,11 @@ impl<T> Unpin for Async<T> {}
 #[cfg(unix)]
 impl<T: AsFd> Async<T> {
     pub fn without_nonblocking(inner: T) -> Self {
-        let source = inner.as_fd().into();
+        // SAFETY: Drop impl will deregister the FD
+        let handle = unsafe { REACTOR.with(|r| r.register(&inner)) };
         Self {
             inner,
-            reg: Registration {
-                source,
-                ids: [None, None],
-            },
+            handle,
             _phantom: PhantomData,
         }
     }
@@ -64,25 +54,6 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-impl Registration {
-    fn disable_event(&mut self, event_idx: usize) {
-        if let Some(id) = self.ids[event_idx] {
-            REACTOR.with(|r| r.modify(id, &self.source, WakeMode::Disable))
-        }
-    }
-
-    fn register_event(&mut self, event_idx: usize, interest: Interest, cx: &mut Context<'_>) {
-        REACTOR.with(|r| match self.ids[event_idx] {
-            Some(id) => r.modify(id, &self.source, WakeMode::Enable(cx.waker())),
-            // Both read and write IDs are guaranteed to be dropped when Async is dropped, so they
-            // won't outlive the inner file object
-            None => unsafe {
-                self.ids[event_idx] = Some(r.register(&self.source, interest, cx.waker().clone()))
-            },
-        });
-    }
-}
-
 impl<T> Async<T> {
     pub fn get_ref(&self) -> &T {
         &self.inner
@@ -90,7 +61,6 @@ impl<T> Async<T> {
 
     fn poll_event<'a, P, F>(
         &'a mut self,
-        event_idx: usize,
         interest: Interest,
         cx: &mut Context<'_>,
         f: F,
@@ -98,44 +68,19 @@ impl<T> Async<T> {
     where
         F: FnOnce(&'a mut T) -> io::Result<P>,
     {
-        let res = match f(&mut self.inner) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Poll::Pending,
-            Err(err) => Poll::Ready(Err(err)),
-        };
-        if res.is_ready() {
-            self.reg.disable_event(event_idx);
-        } else {
-            self.reg.register_event(event_idx, interest, cx);
+        match f(&mut self.inner) {
+            Ok(n) => return Poll::Ready(Ok(n)),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => return Poll::Ready(Err(err)),
         }
-        res
-    }
-
-    fn poll_read_event<'a, P, F>(&'a mut self, cx: &mut Context<'_>, f: F) -> Poll<io::Result<P>>
-    where
-        F: FnOnce(&'a mut T) -> io::Result<P>,
-    {
-        self.poll_event(READ_ID, Interest::Read, cx, f)
-    }
-
-    fn poll_write_event<'a, P, F>(&'a mut self, cx: &mut Context<'_>, f: F) -> Poll<io::Result<P>>
-    where
-        F: FnOnce(&'a mut T) -> io::Result<P>,
-    {
-        self.poll_event(WRITE_ID, Interest::Write, cx, f)
+        REACTOR.with(|r| r.enable_event(&self.handle, interest, cx.waker()));
+        Poll::Pending
     }
 }
 
 impl<T> Drop for Async<T> {
     fn drop(&mut self) {
-        REACTOR.with(|r| {
-            if let Some(id) = self.reg.ids[READ_ID] {
-                r.deregister(id, &self.reg.source);
-            }
-            if let Some(id) = self.reg.ids[WRITE_ID] {
-                r.deregister(id, &self.reg.source);
-            }
-        });
+        REACTOR.with(|r| r.deregister(&self.handle));
     }
 }
 
@@ -145,7 +90,7 @@ impl<T: Read> AsyncRead for Async<T> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_read_event(cx, |inner| inner.read(buf))
+        self.poll_event(Interest::Read, cx, |inner| inner.read(buf))
     }
 }
 
@@ -155,11 +100,11 @@ impl<T: Write> AsyncWrite for Async<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_write_event(cx, |inner| inner.write(buf))
+        self.poll_event(Interest::Write, cx, |inner| inner.write(buf))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_write_event(cx, |inner| inner.flush())
+        self.poll_event(Interest::Write, cx, |inner| inner.flush())
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -170,7 +115,7 @@ impl<T: Write> AsyncWrite for Async<T> {
 impl<T: BufRead> AsyncBufRead for Async<T> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
-        this.poll_read_event(cx, |inner| inner.fill_buf())
+        this.poll_event(Interest::Read, cx, |inner| inner.fill_buf())
     }
 
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
@@ -184,7 +129,7 @@ impl Async<TcpListener> {
     }
 
     pub async fn accept(&mut self) -> io::Result<(Async<TcpStream>, SocketAddr)> {
-        poll_fn(|cx| self.poll_read_event(cx, |inner| inner.accept()))
+        poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.accept()))
             .await
             .and_then(|(st, addr)| Async::new(st).map(|st| (st, addr)))
     }
@@ -194,12 +139,12 @@ impl Async<TcpStream> {
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         let addr = addr.into();
         let mut stream = Async::without_nonblocking(tcp_socket(&addr)?);
-        poll_fn(|cx| stream.poll_write_event(cx, |inner| connect(inner, &addr))).await?;
+        poll_fn(|cx| stream.poll_event(Interest::Write, cx, |inner| connect(inner, &addr))).await?;
         Ok(stream)
     }
 
     pub async fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        poll_fn(|cx| self.poll_read_event(cx, |inner| inner.peek(buf))).await
+        poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.peek(buf))).await
     }
 }
 

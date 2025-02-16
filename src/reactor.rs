@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, RawFd};
 use std::{io, sync::Weak, task::Waker, time::Duration};
 
 use crate::Id;
@@ -21,25 +21,11 @@ impl Interest {
     }
 }
 
-pub(crate) enum WakeMode<'a> {
-    Enable(&'a Waker),
-    Disable,
-}
-
-impl<'a> From<&'a Waker> for WakeMode<'a> {
-    fn from(waker: &'a Waker) -> Self {
-        Self::Enable(waker)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg(unix)]
-pub(crate) struct Source(RawFd);
-#[cfg(unix)]
-impl<'a> From<BorrowedFd<'a>> for Source {
-    fn from(fd: BorrowedFd<'a>) -> Self {
-        Self(fd.as_raw_fd())
-    }
+pub(crate) struct EventHandle {
+    fd: RawFd,
+    id: Id,
 }
 
 /// General trait for the reactor used to wakeup futures
@@ -51,23 +37,21 @@ pub(crate) trait Reactor {
     where
         Self: Sized;
 
+    #[cfg(unix)]
     /// Register new event source onto the reactor along with a Waker that will be pinged if an
     /// event is received on the source. Returns an unique ID to that event source.
     ///
     /// SAFETY: The event source must not be dropped before it's cleared from the reactor via
     /// `deregister()`.
-    unsafe fn register(&self, source: &Source, interest: Interest, waker: Waker) -> Id;
-
-    /// Deregister event source from the reactor
-    fn deregister(&self, id: Id, source: &Source);
-
-    /// Change the waker associated with a registered event source.
-    ///
-    /// If waker is not supplied, then this event is disabled.
-    fn modify(&self, id: Id, source: &Source, mode: WakeMode);
-
+    unsafe fn register<S: AsFd>(&self, source: &S) -> EventHandle;
     #[cfg(not(unix))]
     compile_error!("Unsupported operating system!");
+
+    /// Deregister event source from the reactor
+    fn deregister(&self, handle: &EventHandle);
+
+    /// Enable a registered event source.
+    fn enable_event(&self, handle: &EventHandle, interest: Interest, waker: &Waker);
 
     /// Wait for an event on the reactor with an optional timeout, then clears all event sources.
     fn wait(&self, timeout: Option<Duration>) -> io::Result<()>;
