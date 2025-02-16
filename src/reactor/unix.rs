@@ -193,7 +193,8 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         Arc::downgrade(&self.notifier)
     }
 
-    fn clear_notifications(&self) {
+    fn clear(&self) {
+        self.inner.borrow_mut().clear();
         let _ = self.notifier.clear();
     }
 }

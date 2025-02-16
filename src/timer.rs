@@ -69,6 +69,10 @@ impl TimerQueue {
     fn cancel(&self, id: Id, expiry: Instant) {
         self.timers.borrow_mut().remove(&(expiry, id));
     }
+
+    pub(crate) fn clear(&self) {
+        self.timers.borrow_mut().clear();
+    }
 }
 
 /// Async timer

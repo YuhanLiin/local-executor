@@ -72,9 +72,10 @@ pub fn block_on<T, F>(mut fut: F) -> T
 where
     F: Future<Output = T>,
 {
+    REACTOR.with(|r| r.clear());
+    TIMER_QUEUE.with(|q| q.clear());
     let mut fut = pin!(fut);
     let waker = create_waker(REACTOR.with(|r| r.notifier()));
-    REACTOR.with(|r| r.clear_notifications());
 
     loop {
         if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(&waker)) {
