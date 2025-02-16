@@ -74,6 +74,7 @@ where
 {
     REACTOR.with(|r| r.clear());
     TIMER_QUEUE.with(|q| q.clear());
+
     let mut fut = pin!(fut);
     let waker = create_waker(REACTOR.with(|r| r.notifier()));
 

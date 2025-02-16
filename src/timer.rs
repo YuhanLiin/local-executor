@@ -1,12 +1,16 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
+    error::Error,
+    fmt::Display,
     future::Future,
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
+
+use pin_project_lite::pin_project;
 
 use crate::Id;
 
@@ -76,6 +80,7 @@ impl TimerQueue {
 }
 
 /// Async timer
+#[derive(Debug)]
 pub struct Timer {
     expiry: Instant,
     timer_id: Option<Id>,
@@ -130,6 +135,55 @@ impl Drop for Timer {
         if let Some(id) = self.timer_id {
             TIMER_QUEUE.with(|q| q.cancel(id, self.expiry));
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct TimedOut(());
+impl Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Future timed out")
+    }
+}
+impl Error for TimedOut {}
+
+pin_project! {
+    #[derive(Debug)]
+    pub struct Timeout<F> {
+        #[pin]
+        timer: Timer,
+        #[pin]
+        fut: F,
+    }
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Result<F::Output, TimedOut>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Poll::Ready(out) = self.as_mut().project().fut.poll(cx) {
+            return Poll::Ready(Ok(out));
+        }
+        if let Poll::Ready(()) = self.as_mut().project().timer.poll(cx) {
+            return Poll::Ready(Err(TimedOut(())));
+        }
+        Poll::Pending
+    }
+}
+
+/// Run the future with a timeout, cancelling it if it doesn't complete in time
+pub fn timeout<F: Future>(fut: F, timeout: Duration) -> Timeout<F> {
+    Timeout {
+        timer: Timer::delay(timeout),
+        fut,
+    }
+}
+
+/// Run the future until a point in time, cancelling it if it doesn't complete in time
+pub fn timeout_at<F: Future>(fut: F, expiry: Instant) -> Timeout<F> {
+    Timeout {
+        timer: Timer::at(expiry),
+        fut,
     }
 }
 
@@ -237,5 +291,24 @@ mod tests {
             .is_ready());
         assert!(timer.timer_id.is_none());
         assert!(TIMER_QUEUE.with(|q| q.timers.borrow().is_empty()));
+    }
+
+    #[test]
+    fn timeouts() {
+        let waker = Arc::new(MockWaker::default()).into();
+
+        let res1 = Pin::new(&mut timeout(
+            Timer::at(Instant::now()),
+            Duration::from_secs(10),
+        ))
+        .poll(&mut Context::from_waker(&waker));
+        assert!(matches!(res1, Poll::Ready(Ok(()))));
+
+        let res2 = Pin::new(&mut timeout_at(
+            Timer::delay(Duration::from_secs(10)),
+            Instant::now(),
+        ))
+        .poll(&mut Context::from_waker(&waker));
+        assert!(matches!(res2, Poll::Ready(Err(_))));
     }
 }
