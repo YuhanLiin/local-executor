@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::{io, sync::Weak, task::Waker, time::Duration};
 
 use crate::Id;
@@ -21,6 +21,27 @@ impl Interest {
     }
 }
 
+pub(crate) enum WakeMode<'a> {
+    Enable(&'a Waker),
+    Disable,
+}
+
+impl<'a> From<&'a Waker> for WakeMode<'a> {
+    fn from(waker: &'a Waker) -> Self {
+        Self::Enable(waker)
+    }
+}
+
+#[derive(Debug)]
+#[cfg(unix)]
+pub(crate) struct Source(RawFd);
+#[cfg(unix)]
+impl<'a> From<BorrowedFd<'a>> for Source {
+    fn from(fd: BorrowedFd<'a>) -> Self {
+        Self(fd.as_raw_fd())
+    }
+}
+
 /// General trait for the reactor used to wakeup futures
 pub(crate) trait Reactor {
     type Notifier: Notifier + 'static;
@@ -35,16 +56,15 @@ pub(crate) trait Reactor {
     ///
     /// SAFETY: The event source must not be dropped before it's cleared from the reactor via
     /// `deregister()`.
-    #[cfg(unix)]
-    unsafe fn register<S: AsRawFd>(&self, source: &S, interest: Interest, waker: Waker) -> Id;
+    unsafe fn register(&self, source: &Source, interest: Interest, waker: Waker) -> Id;
 
     /// Deregister event source from the reactor
-    #[cfg(unix)]
-    fn deregister<S: AsRawFd>(&self, id: Id, source: &S);
+    fn deregister(&self, id: Id, source: &Source);
 
-    #[cfg(unix)]
-    /// Change the interested events and waker associated with a registered event source.
-    fn modify<S: AsRawFd>(&self, id: Id, source: &S, interest: Interest, waker: &Waker);
+    /// Change the waker associated with a registered event source.
+    ///
+    /// If waker is not supplied, then this event is disabled.
+    fn modify(&self, id: Id, source: &Source, mode: WakeMode);
 
     #[cfg(not(unix))]
     compile_error!("Unsupported operating system!");

@@ -22,7 +22,7 @@ use rustix::{
 
 use crate::Id;
 
-use super::{Interest, Notifier, Reactor};
+use super::{Interest, Notifier, Reactor, Source, WakeMode};
 
 impl From<Interest> for PollFlags {
     fn from(val: Interest) -> Self {
@@ -41,13 +41,19 @@ pub(crate) struct PollReactor<N: NotifierFd, T: Timeout> {
     timeout: T,
 }
 
+struct EventData {
+    interest: Interest,
+    waker: Waker,
+    enabled: bool,
+}
+
 // The part of reactor that requires interior mutability
 #[derive(Default)]
 struct Inner {
     // All the pollfds will be constructed from raw fds, so don't worry about lifetimes
     pollfds: Vec<PollFd<'static>>,
     ids: Vec<Id>,
-    event_sources: BTreeMap<(Id, RawFd), (Interest, Waker)>,
+    event_sources: BTreeMap<(Id, RawFd), EventData>,
 }
 
 impl Inner {
@@ -74,33 +80,36 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         })
     }
 
-    unsafe fn register<S: AsRawFd>(
-        &self,
-        source: &S,
-        mut interest: Interest,
-        mut waker: Waker,
-    ) -> Id {
+    unsafe fn register(&self, source: &Source, mut interest: Interest, mut waker: Waker) -> Id {
         let mut inner = self.inner.borrow_mut();
-        let fd = source.as_raw_fd();
+        let fd = source.0;
         loop {
             let id = self.current_id.get();
             self.current_id.set(id.overflowing_incr());
             // On the rare chance that the (ID, raw_fd) pair already exists, which can only happen
             // if the ID overflowed and the same FD is still registered on that ID, then just try
             // the next ID.
-            (interest, waker) = match inner.event_sources.insert((id, fd), (interest, waker)) {
+            EventData {
+                interest,
+                waker,
+                ..
+            } = match inner.event_sources.insert(
+                (id, fd),
+                EventData {
+                    interest,
+                    waker,
+                    enabled: true,
+                },
+            ) {
                 None => break id,
                 // Restore the previous event source
-                Some((prev_int, prev_waker)) => inner
-                    .event_sources
-                    .insert((id, fd), (prev_int, prev_waker))
-                    .unwrap(),
+                Some(prev_data) => inner.event_sources.insert((id, fd), prev_data).unwrap(),
             }
         }
     }
 
-    fn deregister<S: AsRawFd>(&self, id: Id, source: &S) {
-        let fd = source.as_raw_fd();
+    fn deregister(&self, id: Id, source: &Source) {
+        let fd = source.0;
         assert!(
             self.inner
                 .borrow_mut()
@@ -111,15 +120,20 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         );
     }
 
-    fn modify<S: AsRawFd>(&self, id: Id, source: &S, interest: Interest, waker: &Waker) {
+    fn modify(&self, id: Id, source: &Source, mode: WakeMode) {
         let mut inner = self.inner.borrow_mut();
-        let fd = source.as_raw_fd();
+        let fd = source.0;
         let entry = inner
             .event_sources
             .get_mut(&(id, fd))
             .expect("Modified event source not found");
-        entry.0 = interest;
-        entry.1.clone_from(waker);
+        match mode {
+            WakeMode::Enable(waker) => {
+                entry.waker.clone_from(waker);
+                entry.enabled = true;
+            }
+            WakeMode::Disable => entry.enabled = false,
+        }
     }
 
     fn wait(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -137,14 +151,16 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         let inner = DropGuard(&mut borrow, self.notifier.as_ref());
         let timeout = self.timeout.set_timeout(timeout)?;
 
-        for ((id, fd), (interest, _)) in &inner.0.event_sources {
-            // SAFETY: pollfds will be cleared by the end of the call
-            let fd = unsafe { BorrowedFd::borrow_raw(*fd) };
-            inner
-                .0
-                .pollfds
-                .push(PollFd::from_borrowed_fd(fd, (*interest).into()));
-            inner.0.ids.push(*id);
+        for ((id, fd), data) in &inner.0.event_sources {
+            if data.enabled {
+                // SAFETY: pollfds will be cleared by the end of the call
+                let fd = unsafe { BorrowedFd::borrow_raw(*fd) };
+                inner
+                    .0
+                    .pollfds
+                    .push(PollFd::from_borrowed_fd(fd, data.interest.into()));
+                inner.0.ids.push(*id);
+            }
         }
 
         // SAFETY: pollfds will be cleared by the end of the call
@@ -178,8 +194,8 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
                             | PollFlags::ERR
                             | PollFlags::PRI,
                     ) {
-                        let (_, waker) = &inner.0.event_sources[&(*id, pollfd.as_fd().as_raw_fd())];
-                        waker.wake_by_ref();
+                        let data = &inner.0.event_sources[&(*id, pollfd.as_fd().as_raw_fd())];
+                        data.waker.wake_by_ref();
                     }
                 }
             }
@@ -517,7 +533,7 @@ mod tests {
 
         // Register 5 events and their respective wakers
         for (ev, wk) in events.iter().zip(&wakers) {
-            unsafe { reactor.register(&ev.fd, Interest::read(), wk.clone().into()) };
+            unsafe { reactor.register(&ev.fd.as_fd().into(), Interest::read(), wk.clone().into()) };
         }
 
         events[0].notify().unwrap();
@@ -543,7 +559,7 @@ mod tests {
 
         // Register 5 events and their respective wakers
         for (ev, wk) in events.iter().zip(&wakers) {
-            unsafe { reactor.register(&ev.fd, Interest::read(), wk.clone().into()) };
+            unsafe { reactor.register(&ev.fd.as_fd().into(), Interest::read(), wk.clone().into()) };
         }
 
         for i in [0, 1, 4] {
@@ -562,21 +578,35 @@ mod tests {
         let event = EventFd::new().unwrap();
         let wakers: Vec<_> = (0..3).map(|_| Arc::new(MockWaker::default())).collect();
 
-        let id = unsafe { reactor.register(&event.fd, Interest::read(), wakers[0].clone().into()) };
+        let id = unsafe {
+            reactor.register(
+                &event.fd.as_fd().into(),
+                Interest::read(),
+                wakers[0].clone().into(),
+            )
+        };
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
         assert!(wakers[0].get());
 
-        reactor.modify(id, &event.fd, Interest::read(), &wakers[1].clone().into());
+        reactor.modify(
+            id,
+            &event.fd.as_fd().into(),
+            WakeMode::Enable(&wakers[1].clone().into()),
+        );
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
         assert!(wakers[1].get());
 
-        reactor.modify(id, &event.fd, Interest::write(), &wakers[2].clone().into());
+        reactor.modify(
+            id,
+            &event.fd.as_fd().into(),
+            WakeMode::Enable(&wakers[2].clone().into()),
+        );
         assert_reactor_wait!(reactor, None).unwrap();
         assert!(wakers[2].get());
 
-        reactor.deregister(id, &event.fd);
+        reactor.deregister(id, &event.fd.as_fd().into());
         assert!(reactor.inner.borrow().event_sources.is_empty());
     }
 
@@ -586,12 +616,27 @@ mod tests {
         let event = EventFd::new().unwrap();
         let wakers: Vec<_> = (0..3).map(|_| Arc::new(MockWaker::default())).collect();
 
-        let id1 =
-            unsafe { reactor.register(&event.fd, Interest::read(), wakers[0].clone().into()) };
-        let id2 =
-            unsafe { reactor.register(&event.fd, Interest::read(), wakers[1].clone().into()) };
-        let _id3 =
-            unsafe { reactor.register(&event.fd, Interest::read(), wakers[2].clone().into()) };
+        let id1 = unsafe {
+            reactor.register(
+                &event.fd.as_fd().into(),
+                Interest::read(),
+                wakers[0].clone().into(),
+            )
+        };
+        let id2 = unsafe {
+            reactor.register(
+                &event.fd.as_fd().into(),
+                Interest::read(),
+                wakers[1].clone().into(),
+            )
+        };
+        let _id3 = unsafe {
+            reactor.register(
+                &event.fd.as_fd().into(),
+                Interest::read(),
+                wakers[2].clone().into(),
+            )
+        };
 
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
@@ -602,8 +647,8 @@ mod tests {
         for wk in &wakers {
             wk.set(false);
         }
-        reactor.deregister(id1, &event.fd);
-        reactor.deregister(id2, &event.fd);
+        reactor.deregister(id1, &event.fd.as_fd().into());
+        reactor.deregister(id2, &event.fd.as_fd().into());
 
         event.notify().unwrap();
         assert_reactor_wait!(reactor, None).unwrap();
@@ -618,14 +663,16 @@ mod tests {
         let event = EventFd::new().unwrap();
         let waker: Waker = Arc::new(MockWaker::default()).into();
 
-        let id = unsafe { reactor.register(&event.fd, Interest::read(), waker.clone()) };
+        let id =
+            unsafe { reactor.register(&event.fd.as_fd().into(), Interest::read(), waker.clone()) };
         assert_eq!(id.0.get(), 1);
 
         reactor.current_id.set(Id::new(usize::MAX));
         // This ID will be usize::MAX
-        unsafe { reactor.register(&event.fd, Interest::read(), waker.clone()) };
+        unsafe { reactor.register(&event.fd.as_fd().into(), Interest::read(), waker.clone()) };
         // This ID should be 2, not 1
-        let id = unsafe { reactor.register(&event.fd, Interest::read(), waker.clone()) };
+        let id =
+            unsafe { reactor.register(&event.fd.as_fd().into(), Interest::read(), waker.clone()) };
         assert_eq!(id.0.get(), 2);
     }
 

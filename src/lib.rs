@@ -1,3 +1,4 @@
+pub mod io;
 mod reactor;
 #[cfg(test)]
 mod test;

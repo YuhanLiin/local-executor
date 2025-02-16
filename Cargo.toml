@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rustix = { version = "0.38", features = ["event", "time", "pipe"] }
+rustix = { version = "0.38", features = ["event", "time", "pipe", "fs", "net"] }
 pin-project-lite = "0.2.16"
+futures-io = "0.3"
