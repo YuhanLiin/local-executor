@@ -60,6 +60,24 @@ impl<T> Async<T> {
     }
 
     fn poll_event<'a, P, F>(
+        &'a self,
+        interest: Interest,
+        cx: &mut Context<'_>,
+        f: F,
+    ) -> Poll<io::Result<P>>
+    where
+        F: FnOnce(&'a T) -> io::Result<P>,
+    {
+        match f(&self.inner) {
+            Ok(n) => return Poll::Ready(Ok(n)),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => return Poll::Ready(Err(err)),
+        }
+        REACTOR.with(|r| r.enable_event(&self.handle, interest, cx.waker()));
+        Poll::Pending
+    }
+
+    fn poll_event_mut<'a, P, F>(
         &'a mut self,
         interest: Interest,
         cx: &mut Context<'_>,
@@ -90,7 +108,20 @@ impl<T: Read> AsyncRead for Async<T> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_event(Interest::Read, cx, |inner| inner.read(buf))
+        self.poll_event_mut(Interest::Read, cx, |inner| inner.read(buf))
+    }
+}
+
+impl<'a, T> AsyncRead for &'a Async<T>
+where
+    &'a T: Read,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_event(Interest::Read, cx, |mut inner| inner.read(buf))
     }
 }
 
@@ -100,11 +131,32 @@ impl<T: Write> AsyncWrite for Async<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_event(Interest::Write, cx, |inner| inner.write(buf))
+        self.poll_event_mut(Interest::Write, cx, |inner| inner.write(buf))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_event(Interest::Write, cx, |inner| inner.flush())
+        self.poll_event_mut(Interest::Write, cx, |inner| inner.flush())
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+impl<'a, T> AsyncWrite for &'a Async<T>
+where
+    &'a T: Write,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_event(Interest::Write, cx, |mut inner| inner.write(buf))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_event(Interest::Write, cx, |mut inner| inner.flush())
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -115,7 +167,7 @@ impl<T: Write> AsyncWrite for Async<T> {
 impl<T: BufRead> AsyncBufRead for Async<T> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
-        this.poll_event(Interest::Read, cx, |inner| inner.fill_buf())
+        this.poll_event_mut(Interest::Read, cx, |inner| inner.fill_buf())
     }
 
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
@@ -128,7 +180,7 @@ impl Async<TcpListener> {
         Async::new(TcpListener::bind(addr.into())?)
     }
 
-    pub async fn accept(&mut self) -> io::Result<(Async<TcpStream>, SocketAddr)> {
+    pub async fn accept(&self) -> io::Result<(Async<TcpStream>, SocketAddr)> {
         poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.accept()))
             .await
             .and_then(|(st, addr)| Async::new(st).map(|st| (st, addr)))
@@ -138,16 +190,17 @@ impl Async<TcpListener> {
 impl Async<TcpStream> {
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         let addr = addr.into();
-        let mut stream = Async::without_nonblocking(tcp_socket(&addr)?);
+        let stream = Async::without_nonblocking(tcp_socket(&addr)?);
         poll_fn(|cx| stream.poll_event(Interest::Write, cx, |inner| connect(inner, &addr))).await?;
         Ok(stream)
     }
 
-    pub async fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.peek(buf))).await
     }
 }
 
+#[cfg(unix)]
 fn tcp_socket(addr: &SocketAddr) -> io::Result<TcpStream> {
     use rustix::net::*;
 
@@ -162,6 +215,7 @@ fn tcp_socket(addr: &SocketAddr) -> io::Result<TcpStream> {
     Ok(socket.into())
 }
 
+#[cfg(unix)]
 fn connect(tcp: &TcpStream, addr: &SocketAddr) -> io::Result<()> {
     rustix::net::connect(tcp.as_fd(), addr)?;
     Ok(())
