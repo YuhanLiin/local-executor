@@ -16,9 +16,18 @@ use crate::{
     Reactor, REACTOR,
 };
 
+// Deregisters the event handle on drop to ensure I/O safety
+struct GuardedHandle(EventHandle);
+impl Drop for GuardedHandle {
+    fn drop(&mut self) {
+        REACTOR.with(|r| r.deregister(&self.0));
+    }
+}
+
 pub struct Async<T> {
+    // Make sure the handle is dropped before the inner I/O type
+    handle: GuardedHandle,
     inner: T,
-    handle: EventHandle,
     _phantom: PhantomData<*const ()>,
 }
 
@@ -27,8 +36,8 @@ impl<T> Unpin for Async<T> {}
 #[cfg(unix)]
 impl<T: AsFd> Async<T> {
     pub fn without_nonblocking(inner: T) -> Self {
-        // SAFETY: Drop impl will deregister the FD
-        let handle = unsafe { REACTOR.with(|r| r.register(&inner)) };
+        // SAFETY: GuardedHandle's Drop impl will deregister the FD
+        let handle = GuardedHandle(unsafe { REACTOR.with(|r| r.register(&inner)) });
         Self {
             inner,
             handle,
@@ -59,6 +68,10 @@ impl<T> Async<T> {
         &self.inner
     }
 
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
     fn poll_event<'a, P, F>(
         &'a self,
         interest: Interest,
@@ -73,7 +86,7 @@ impl<T> Async<T> {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {}
             Err(err) => return Poll::Ready(Err(err)),
         }
-        REACTOR.with(|r| r.enable_event(&self.handle, interest, cx.waker()));
+        REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
         Poll::Pending
     }
 
@@ -91,14 +104,8 @@ impl<T> Async<T> {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {}
             Err(err) => return Poll::Ready(Err(err)),
         }
-        REACTOR.with(|r| r.enable_event(&self.handle, interest, cx.waker()));
+        REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
         Poll::Pending
-    }
-}
-
-impl<T> Drop for Async<T> {
-    fn drop(&mut self) {
-        REACTOR.with(|r| r.deregister(&self.handle));
     }
 }
 
