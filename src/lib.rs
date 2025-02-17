@@ -83,7 +83,10 @@ where
         }
 
         if let Err(err) = REACTOR.with(|r| r.wait(TIMER_QUEUE.with(|q| q.next_timeout()))) {
-            log::error!("Error polling reactor: {err}");
+            log::error!(
+                "{:?} Error polling reactor: {err}",
+                std::thread::current().id()
+            );
         }
     }
 }

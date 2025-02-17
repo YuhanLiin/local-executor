@@ -140,7 +140,8 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             .is_none()
         {
             log::error!(
-                "Deregistering non-existent event source {{ fd = {}, id = {} }}",
+                "{:?} Deregistering non-existent event source {{ fd = {}, id = {} }}",
+                std::thread::current().id(),
                 handle.fd,
                 handle.id.0
             );
@@ -157,7 +158,8 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             dir.enable(waker);
         } else {
             log::error!(
-                "Enabling non-existent event source {{ fd = {}, id = {} }}",
+                "{:?} Enabling non-existent event source {{ fd = {}, id = {} }}",
+                std::thread::current().id(),
                 handle.fd,
                 handle.id.0
             );
@@ -172,7 +174,10 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
                 self.0.pollfds.clear();
                 self.0.ids.clear();
                 if let Err(err) = self.1.clear() {
-                    log::error!("Error clearing notifications: {err}");
+                    log::error!(
+                        "{:?} Error clearing notifications: {err}",
+                        std::thread::current().id(),
+                    );
                 }
             }
         }
@@ -200,7 +205,11 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             self.timeout.register(&mut inner.0.pollfds);
         }
 
-        log::trace!("Reactor polling {} event sources", inner.0.ids.len());
+        log::trace!(
+            "{:?} Reactor polling {} event sources",
+            std::thread::current().id(),
+            inner.0.ids.len()
+        );
         match poll(&mut inner.0.pollfds, timeout)? {
             // If poll timed out, don't bother checking the wakers
             0 => {}
@@ -245,7 +254,10 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
 
     fn clear_notifications(&self) {
         if let Err(err) = self.notifier.clear() {
-            log::error!("Error clearing notifications: {err}");
+            log::error!(
+                "{:?} Error clearing notifications: {err}",
+                std::thread::current().id(),
+            );
         }
     }
 

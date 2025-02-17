@@ -63,7 +63,11 @@ impl TimerQueue {
             .insert((expiry, id), waker)
             .is_some()
         {
-            log::warn!("Timer ID collision at ID = {}", id.0);
+            log::warn!(
+                "{:?} Timer ID collision at ID = {}",
+                std::thread::current().id(),
+                id.0
+            );
         }
         id
     }
@@ -73,7 +77,11 @@ impl TimerQueue {
         if let Some(wk) = self.timers.borrow_mut().get_mut(&(expiry, id)) {
             wk.clone_from(waker)
         } else {
-            log::error!("Modifying non-existent timer ID = {}", id.0);
+            log::error!(
+                "{:?} Modifying non-existent timer ID = {}",
+                std::thread::current().id(),
+                id.0
+            );
         }
     }
 
