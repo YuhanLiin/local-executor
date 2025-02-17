@@ -45,3 +45,33 @@ fn single_thread_echo() {
         zip(fut1, fut2).await;
     });
 }
+
+#[test]
+fn echo_with_channel() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Trace)
+        .try_init();
+
+    let (send, recv) = flume::bounded(0);
+    let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0)).unwrap();
+    let addr = listener.get_ref().local_addr().unwrap();
+
+    let th = std::thread::spawn(move || {
+        block_on(async {
+            let mut stream = Async::<TcpStream>::connect(addr).await.unwrap();
+            send.send_async(b"deadbeef").await.unwrap();
+            let mut data = vec![];
+            stream.read_to_end(&mut data).await.unwrap();
+            assert_eq!(data, b"deadbeef");
+        });
+    });
+
+    block_on(async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let msg = recv.recv_async().await.unwrap();
+        stream.write_all(msg).await.unwrap();
+    });
+
+    th.join().unwrap();
+}
