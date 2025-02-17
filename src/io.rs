@@ -68,6 +68,7 @@ impl<T> Async<T> {
         &self.inner
     }
 
+    /// Deregisters the I/O handle from the reactor and return it
     pub fn into_inner(self) -> T {
         self.inner
     }
@@ -224,6 +225,64 @@ fn tcp_socket(addr: &SocketAddr) -> io::Result<TcpStream> {
 
 #[cfg(unix)]
 fn connect(tcp: &TcpStream, addr: &SocketAddr) -> io::Result<()> {
-    rustix::net::connect(tcp.as_fd(), addr)?;
-    Ok(())
+    match rustix::net::connect(tcp.as_fd(), addr) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::INPROGRESS) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, io::stderr, pin::pin, sync::Arc};
+
+    use crate::{block_on, test::MockWaker};
+
+    use super::*;
+
+    #[test]
+    fn deregister_on_drop() {
+        let io = Async::without_nonblocking(stderr());
+        assert!(!REACTOR.with(|r| r.is_empty()));
+        drop(io);
+        assert!(REACTOR.with(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn deregister_into_inner() {
+        let io = Async::without_nonblocking(stderr());
+        assert!(!REACTOR.with(|r| r.is_empty()));
+        let _inner = io.into_inner();
+        assert!(REACTOR.with(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn tcp() {
+        let accept_waker = Arc::new(MockWaker::default());
+        let connect_waker = Arc::new(MockWaker::default());
+
+        let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0)).unwrap();
+        let addr = listener.get_ref().local_addr().unwrap();
+        let mut accept = pin!(listener.accept());
+        assert!(accept
+            .as_mut()
+            .poll(&mut Context::from_waker(&accept_waker.clone().into()))
+            .is_pending());
+        let mut connect = pin!(Async::<TcpStream>::connect(addr));
+        assert!(connect
+            .as_mut()
+            .poll(&mut Context::from_waker(&accept_waker.clone().into()))
+            .is_pending());
+
+        block_on(async {
+            let accepted = accept.await.unwrap();
+            let conneted = connect.await.unwrap();
+        });
+
+        let mut connect = pin!(Async::<TcpStream>::connect(addr));
+        assert!(connect
+            .as_mut()
+            .poll(&mut Context::from_waker(&connect_waker.into()))
+            .is_pending());
+    }
 }

@@ -243,6 +243,10 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         self.inner.borrow_mut().clear();
         let _ = self.notifier.clear();
     }
+
+    fn is_empty(&self) -> bool {
+        self.inner.borrow().event_sources.is_empty()
+    }
 }
 
 /// Method of notifying the reactor to wake it up
