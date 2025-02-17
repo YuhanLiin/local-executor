@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures_lite::StreamExt;
-use simple_executor::{
+use local_runtime::{
     block_on,
     timer::{timeout, Periodic, Timer},
 };

@@ -1,7 +1,7 @@
 use std::net::{TcpListener, TcpStream};
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
-use simple_executor::{block_on, io::Async, join};
+use local_runtime::{block_on, io::Async, join};
 
 #[test]
 fn single_thread_echo() {
