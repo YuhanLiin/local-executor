@@ -3,9 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_lite::StreamExt;
 use simple_executor::{
     block_on,
-    timer::{timeout, Timer},
+    timer::{timeout, Periodic, Timer},
 };
 
 #[test]
@@ -19,6 +20,7 @@ fn timer_test() {
 
 #[test]
 fn timeout_test() {
+    let now = Instant::now();
     block_on(async {
         assert!(timeout(pending::<()>(), Duration::from_nanos(100))
             .await
@@ -28,4 +30,21 @@ fn timeout_test() {
             12
         );
     });
+    assert!(now.elapsed() >= Duration::from_nanos(100));
+}
+
+#[test]
+fn periodic_test() {
+    let mut count = 0;
+    block_on(async {
+        let fut = async {
+            let mut periodic = Periodic::interval(Duration::from_micros(100));
+            loop {
+                periodic.next().await.unwrap();
+                count += 1;
+            }
+        };
+        timeout(fut, Duration::from_micros(750)).await.unwrap_err();
+    });
+    assert_eq!(count, 7);
 }

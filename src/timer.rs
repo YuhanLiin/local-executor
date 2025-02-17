@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_core::Stream;
 use pin_project_lite::pin_project;
 
 use crate::Id;
@@ -54,22 +55,18 @@ impl TimerQueue {
     /// Register a new timer with its waker, returning an ID
     ///
     /// Each timer is uniquely identified by the combination of its ID and expiry
-    fn register(&self, expiry: Instant, waker: Waker) -> Id {
-        let id = self.current_id.get();
-        self.current_id.set(id.overflowing_incr());
-        if self
-            .timers
-            .borrow_mut()
-            .insert((expiry, id), waker)
-            .is_some()
-        {
-            log::warn!(
-                "{:?} Timer ID collision at ID = {}",
-                std::thread::current().id(),
-                id.0
-            );
+    fn register(&self, expiry: Instant, mut waker: Waker) -> Id {
+        let mut timer = self.timers.borrow_mut();
+        loop {
+            let id = self.current_id.get();
+            self.current_id.set(id.overflowing_incr());
+            waker = match timer.insert((expiry, id), waker) {
+                None => break id,
+                // If the (expiry, id) pair already exists, restore the previous waker and try with
+                // the next ID
+                Some(prev_waker) => timer.insert((expiry, id), prev_waker).unwrap(),
+            }
         }
-        id
     }
 
     /// Modify the waker on an existing timer
@@ -120,34 +117,107 @@ impl Timer {
     pub fn delay(delay: Duration) -> Self {
         Self::at(Instant::now() + delay)
     }
-}
 
-impl Future for Timer {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.expiry <= Instant::now() {
-            if let Some(id) = self.timer_id {
-                TIMER_QUEUE.with(|q| q.cancel(id, self.expiry));
-                self.timer_id = None;
-            }
-            return Poll::Ready(());
-        }
-
+    fn register(&mut self, cx: &mut Context<'_>) {
         TIMER_QUEUE.with(|q| match self.timer_id {
             None => {
                 self.timer_id = Some(q.register(self.expiry, cx.waker().clone()));
             }
             Some(id) => q.modify(id, self.expiry, cx.waker()),
         });
+    }
+
+    pub fn set_at(&mut self, expiry: Instant) {
+        self.expiry = expiry;
+    }
+
+    pub fn set_delay(&mut self, delay: Duration) {
+        self.expiry = Instant::now() + delay;
+    }
+}
+
+impl Future for Timer {
+    type Output = Instant;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.expiry <= Instant::now() {
+            // Deregister the timer to prevent the waker from being called
+            if let Some(id) = self.timer_id.take() {
+                TIMER_QUEUE.with(|q| q.cancel(id, self.expiry));
+            }
+            return Poll::Ready(self.expiry);
+        }
+
+        self.register(cx);
         Poll::Pending
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        if let Some(id) = self.timer_id {
+        if let Some(id) = self.timer_id.take() {
             TIMER_QUEUE.with(|q| q.cancel(id, self.expiry));
+        }
+    }
+}
+
+pub fn sleep(duration: Duration) -> Timer {
+    Timer::delay(duration)
+}
+
+pub struct Periodic {
+    timer: Timer,
+    period: Duration,
+}
+
+impl Periodic {
+    pub fn interval(period: Duration) -> Self {
+        Self {
+            timer: Timer::delay(period),
+            period,
+        }
+    }
+
+    pub fn interval_at(start: Instant, period: Duration) -> Self {
+        Self {
+            timer: Timer::at(start),
+            period,
+        }
+    }
+
+    pub fn set_at(&mut self, start: Instant) {
+        self.timer.expiry = start;
+    }
+
+    pub fn set_delay(&mut self, delay: Duration) {
+        self.timer.expiry = Instant::now() + delay;
+    }
+
+    pub fn set_interval(&mut self, period: Duration) {
+        self.period = period;
+    }
+}
+
+impl Future for Periodic {
+    type Output = Instant;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_next(cx).map(Option::unwrap)
+    }
+}
+
+impl Stream for Periodic {
+    type Item = Instant;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Poll::Ready(expiry) = Pin::new(&mut self.timer).poll(cx) {
+            let next = expiry + self.period;
+            self.timer.expiry = next;
+            // Re-register timer onto the reactor after timer expiry
+            self.timer.register(cx);
+            Poll::Ready(Some(expiry))
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -179,7 +249,7 @@ impl<F: Future> Future for Timeout<F> {
         if let Poll::Ready(out) = self.as_mut().project().fut.poll(cx) {
             return Poll::Ready(Ok(out));
         }
-        if let Poll::Ready(()) = self.as_mut().project().timer.poll(cx) {
+        if self.as_mut().project().timer.poll(cx).is_ready() {
             return Poll::Ready(Err(TimedOut(())));
         }
         Poll::Pending
@@ -204,7 +274,7 @@ pub fn timeout_at<F: Future>(fut: F, expiry: Instant) -> Timeout<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{pin::pin, sync::Arc};
 
     use crate::test::MockWaker;
 
@@ -292,20 +362,48 @@ mod tests {
     #[test]
     fn timer() {
         let waker = Arc::new(MockWaker::default());
-        let mut timer = Timer::delay(Duration::from_millis(10));
+        let mut timer = pin!(Timer::delay(Duration::from_millis(10)));
 
-        assert!(Pin::new(&mut timer)
+        assert!(timer
+            .as_mut()
             .poll(&mut Context::from_waker(&waker.clone().into()))
             .is_pending());
         assert!(timer.timer_id.is_some());
         assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
 
         std::thread::sleep(Duration::from_millis(10));
-        assert!(Pin::new(&mut timer)
+        assert!(timer
+            .as_mut()
             .poll(&mut Context::from_waker(&waker.into()))
             .is_ready());
         assert!(timer.timer_id.is_none());
         assert!(TIMER_QUEUE.with(|q| q.timers.borrow().is_empty()));
+    }
+
+    #[test]
+    fn periodic() {
+        let waker = Arc::new(MockWaker::default());
+        let mut periodic = pin!(Periodic::interval(Duration::from_millis(5)));
+
+        assert!(periodic
+            .as_mut()
+            .poll_next(&mut Context::from_waker(&waker.clone().into()))
+            .is_pending());
+        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(periodic
+            .as_mut()
+            .poll_next(&mut Context::from_waker(&waker.clone().into()))
+            .is_ready());
+        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(periodic
+            .as_mut()
+            .poll_next(&mut Context::from_waker(&waker.clone().into()))
+            .is_ready());
+        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
     }
 
     #[test]
@@ -317,7 +415,7 @@ mod tests {
             Duration::from_secs(10),
         ))
         .poll(&mut Context::from_waker(&waker));
-        assert!(matches!(res1, Poll::Ready(Ok(()))));
+        assert!(matches!(res1, Poll::Ready(Ok(_))));
 
         let res2 = Pin::new(&mut timeout_at(
             Timer::delay(Duration::from_secs(10)),
