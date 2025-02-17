@@ -59,7 +59,7 @@ pub(crate) trait Reactor {
     /// Return a handle to a notifier object that can be used to wake up the reactor.
     fn notifier(&self) -> Weak<Self::Notifier>;
 
-    fn clear(&self);
+    fn clear_notifications(&self);
 
     fn is_empty(&self) -> bool;
 }
