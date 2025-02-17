@@ -35,60 +35,76 @@ impl JoinWaker {
     }
 }
 
-type PinFut<'a> = Pin<&'a mut dyn Future<Output = ()>>;
+type PinFut<'a, T> = Pin<&'a mut dyn Future<Output = T>>;
 
-pub struct JoinFuture<'a, const N: usize> {
-    futures: [Option<PinFut<'a>>; N],
-    wakers: [Option<Arc<JoinWaker>>; N],
+enum Inflight<'a, T> {
+    Fut(PinFut<'a, T>),
+    Done(T),
 }
 
-impl<'a, const N: usize> JoinFuture<'a, N> {
-    pub fn new(futures: [PinFut<'a>; N]) -> Self {
+impl<'a, T> Inflight<'a, T> {
+    fn unwrap_done(self) -> T {
+        match self {
+            Inflight::Fut(_) => panic!("expected inflight future to be done"),
+            Inflight::Done(val) => val,
+        }
+    }
+}
+
+pub struct JoinFuture<'a, T, const N: usize> {
+    inflight: Option<[Inflight<'a, T>; N]>,
+    wakers: [Option<(Arc<JoinWaker>, Waker)>; N],
+}
+
+impl<'a, T, const N: usize> JoinFuture<'a, T, N> {
+    pub fn new(futures: [PinFut<'a, T>; N]) -> Self {
         Self {
-            futures: futures.map(Some),
+            inflight: Some(futures.map(Inflight::Fut)),
             wakers: std::array::from_fn(|_| None),
         }
     }
 }
 
-fn poll_join(
-    futures: &mut [Option<PinFut>],
-    wakers: &mut [Option<Arc<JoinWaker>>],
+fn poll_join<T>(
+    inflights: &mut [Inflight<T>],
+    wakers: &mut [Option<(Arc<JoinWaker>, Waker)>],
     cx: &mut Context,
 ) -> Poll<()> {
     let mut out = Poll::Ready(());
-    for (fut_opt, waker) in futures.iter_mut().zip(wakers.iter_mut()) {
-        if let Some(fut) = fut_opt {
-            let waker = waker.get_or_insert_with(|| Arc::new(JoinWaker::from(cx.waker().clone())));
+    for (inflight, waker) in inflights.iter_mut().zip(wakers.iter_mut()) {
+        if let Inflight::Fut(fut) = inflight {
+            let (waker_data, waker) = waker.get_or_insert_with(|| {
+                let waker_data = Arc::new(JoinWaker::from(cx.waker().clone()));
+                let waker = waker_data.clone().into();
+                (waker_data, waker)
+            });
 
-            if waker.check_awoken()
-                && fut
-                    .as_mut()
-                    .poll(&mut Context::from_waker(&waker.clone().into()))
-                    .is_ready()
-            {
-                *fut_opt = None;
-            } else {
-                out = Poll::Pending;
+            if waker_data.check_awoken() {
+                if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(waker)) {
+                    *inflight = Inflight::Done(out);
+                    continue;
+                }
             }
+            out = Poll::Pending;
         }
     }
     out
 }
 
-impl<const N: usize> Future for JoinFuture<'_, N> {
-    type Output = ();
+impl<T: Unpin, const N: usize> Future for JoinFuture<'_, T, N> {
+    type Output = [T; N];
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        poll_join(&mut this.futures, &mut this.wakers, cx)
+        poll_join(this.inflight.as_mut().unwrap(), &mut this.wakers, cx)
+            .map(|_| this.inflight.take().unwrap().map(Inflight::unwrap_done))
     }
 }
 
 #[macro_export]
 macro_rules! join {
     ($($fut:expr),+ $(,)?) => {
-        $crate::JoinFuture::new([$(std::pin::pin!($fut)),+])
+        async { $crate::JoinFuture::new([$(std::pin::pin!($fut)),+]).await }
     };
 }
 
@@ -143,17 +159,17 @@ mod tests {
 
     #[test]
     fn scoping() {
-        block_on(async {
+        let out = block_on(async {
             let joined = {
-                let fut1 = async {};
+                let fut1 = async { 5 };
                 let fut2 = async {
                     sleep(Duration::from_nanos(1)).await;
+                    12
                 };
-                async {
-                    join!(fut1, fut2).await;
-                }
+                join!(fut1, fut2)
             };
             joined.await
         });
+        assert_eq!(out, [5, 12]);
     }
 }
