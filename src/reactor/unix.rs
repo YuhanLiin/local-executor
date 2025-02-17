@@ -200,6 +200,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             self.timeout.register(&mut inner.0.pollfds);
         }
 
+        log::trace!("Reactor polling {} event sources", inner.0.ids.len());
         match poll(&mut inner.0.pollfds, timeout)? {
             // If poll timed out, don't bother checking the wakers
             0 => {}
@@ -279,8 +280,10 @@ impl NotifierFd for EventFd {
 
     fn clear(&self) -> io::Result<()> {
         // Sets eventfd to 0
-        rustix::io::read(&self.fd, &mut [0u8; 8]).map(drop)?;
-        Ok(())
+        match rustix::io::read(&self.fd, &mut [0u8; 8]).map_err(io::Error::from) {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            res => res.map(drop),
+        }
     }
 
     fn notify(&self) -> io::Result<()> {
@@ -317,8 +320,10 @@ impl NotifierFd for PipeFd {
         // Ideally we want to clear every notification, but each notification requires one byte of
         // memory to read out. Since this pipe will be wrapped in a `FlagNotifier`, there shouldn't
         // be more than one notification written at a time, so reading 8 bytes should suffice.
-        rustix::io::read(&self.read, &mut [0u8; 8])?;
-        Ok(())
+        match rustix::io::read(&self.read, &mut [0u8; 8]).map_err(io::Error::from) {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            res => res.map(drop),
+        }
     }
 
     fn notify(&self) -> io::Result<()> {
@@ -563,6 +568,37 @@ mod tests {
         assert_reactor_wait!(reactor, Some(Duration::from_nanos(10))).unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_nanos(10) && elapsed < Duration::from_millis(1));
+    }
+
+    #[test]
+    fn clear_notifier_and_timerfd() {
+        let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
+        let waker = Arc::new(MockWaker::default());
+        let efd = EventFd::new().unwrap();
+        let timerfd = TimerFd::new().unwrap();
+        let pipe = PipeFd::new().unwrap();
+
+        let handle = unsafe { reactor.register(&efd.fd) };
+        reactor.enable_event(&handle, Interest::Read, &waker.clone().into());
+        let handle = unsafe { reactor.register(&timerfd.fd) };
+        reactor.enable_event(&handle, Interest::Read, &waker.clone().into());
+        let handle = unsafe { reactor.register(&pipe.read) };
+        reactor.enable_event(&handle, Interest::Read, &waker.clone().into());
+
+        efd.notify().unwrap();
+        pipe.notify().unwrap();
+        timerfd.set_timeout(Some(Duration::ZERO)).unwrap();
+        efd.clear().unwrap();
+        pipe.clear().unwrap();
+        timerfd.set_timeout(None).unwrap();
+
+        reactor.wait(Some(Duration::from_millis(10))).unwrap();
+        // Check that none of the event sources actually fired
+        assert!(!waker.get());
+
+        // Make sure clear() doesn't error even without notification
+        efd.clear().unwrap();
+        pipe.clear().unwrap();
     }
 
     #[test]

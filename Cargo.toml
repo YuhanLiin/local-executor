@@ -8,3 +8,8 @@ rustix = { version = "0.38", features = ["event", "time", "pipe", "fs", "net"] }
 pin-project-lite = "0.2.16"
 futures-io = "0.3"
 log = "0.4"
+
+[dev-dependencies]
+futures-lite = "2.6.0"
+env_logger = "0.11.6"
+
