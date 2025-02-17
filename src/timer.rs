@@ -94,6 +94,7 @@ impl TimerQueue {
 
 /// Async timer
 #[derive(Debug)]
+#[must_use = "Futures do nothing unless polled"]
 pub struct Timer {
     expiry: Instant,
     timer_id: Option<Id>,
@@ -162,6 +163,7 @@ impl Error for TimedOut {}
 
 pin_project! {
     #[derive(Debug)]
+    #[must_use = "Futures do nothing unless polled"]
     pub struct Timeout<F> {
         #[pin]
         timer: Timer,
