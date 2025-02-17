@@ -11,16 +11,6 @@ pub(crate) enum Interest {
     Write,
 }
 
-impl Interest {
-    pub(crate) fn read() -> Self {
-        Self::Read
-    }
-
-    pub(crate) fn write() -> Self {
-        Self::Write
-    }
-}
-
 #[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg(unix)]
 pub(crate) struct EventHandle {
@@ -61,6 +51,7 @@ pub(crate) trait Reactor {
 
     fn clear_notifications(&self);
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool;
 }
 

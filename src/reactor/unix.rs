@@ -2,7 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Weak,
@@ -248,6 +248,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         }
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.inner.borrow().event_sources.is_empty()
     }
@@ -297,6 +298,7 @@ impl NotifierFd for EventFd {
 }
 
 /// Unix pipe for notifying the reactor on non-Linux platforms
+#[allow(unused)]
 pub(crate) struct PipeFd {
     read: OwnedFd,
     write: OwnedFd,
@@ -391,6 +393,7 @@ pub(crate) trait Timeout {
 /// Use the timeout argument of poll() to handle timers
 ///
 /// Limited to only millisecond precision
+#[allow(unused)]
 struct PollTimeout;
 
 impl Timeout for PollTimeout {
