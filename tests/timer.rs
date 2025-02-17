@@ -38,7 +38,7 @@ fn periodic_test() {
     let mut count = 0;
     block_on(async {
         let fut = async {
-            let mut periodic = Periodic::interval(Duration::from_micros(100));
+            let mut periodic = Periodic::periodic(Duration::from_micros(100));
             loop {
                 periodic.next().await.unwrap();
                 count += 1;

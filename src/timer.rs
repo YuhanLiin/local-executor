@@ -126,14 +126,6 @@ impl Timer {
             Some(id) => q.modify(id, self.expiry, cx.waker()),
         });
     }
-
-    pub fn set_at(&mut self, expiry: Instant) {
-        self.expiry = expiry;
-    }
-
-    pub fn set_delay(&mut self, delay: Duration) {
-        self.expiry = Instant::now() + delay;
-    }
 }
 
 impl Future for Timer {
@@ -171,29 +163,22 @@ pub struct Periodic {
 }
 
 impl Periodic {
-    pub fn interval(period: Duration) -> Self {
+    #[allow(clippy::self_named_constructors)]
+    pub fn periodic(period: Duration) -> Self {
         Self {
             timer: Timer::delay(period),
             period,
         }
     }
 
-    pub fn interval_at(start: Instant, period: Duration) -> Self {
+    pub fn periodic_at(start: Instant, period: Duration) -> Self {
         Self {
             timer: Timer::at(start),
             period,
         }
     }
 
-    pub fn set_at(&mut self, start: Instant) {
-        self.timer.expiry = start;
-    }
-
-    pub fn set_delay(&mut self, delay: Duration) {
-        self.timer.expiry = Instant::now() + delay;
-    }
-
-    pub fn set_interval(&mut self, period: Duration) {
+    pub fn set_period(&mut self, period: Duration) {
         self.period = period;
     }
 }
@@ -383,7 +368,7 @@ mod tests {
     #[test]
     fn periodic() {
         let waker = Arc::new(MockWaker::default());
-        let mut periodic = pin!(Periodic::interval(Duration::from_millis(5)));
+        let mut periodic = pin!(Periodic::periodic(Duration::from_millis(5)));
 
         assert!(periodic
             .as_mut()
