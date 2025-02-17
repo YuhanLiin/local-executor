@@ -132,27 +132,36 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
     }
 
     fn deregister(&self, handle: &EventHandle) {
-        assert!(
-            self.inner
-                .borrow_mut()
-                .event_sources
-                .remove(handle)
-                .is_some(),
-            "Removed event source not found"
-        );
+        if self
+            .inner
+            .borrow_mut()
+            .event_sources
+            .remove(handle)
+            .is_none()
+        {
+            log::error!(
+                "Deregistering non-existent event source {{ fd = {}, id = {} }}",
+                handle.fd,
+                handle.id.0
+            );
+        }
     }
 
     fn enable_event(&self, handle: &EventHandle, interest: Interest, waker: &Waker) {
         let mut inner = self.inner.borrow_mut();
-        let entry = inner
-            .event_sources
-            .get_mut(handle)
-            .expect("Modified event source not found");
-        let dir = match interest {
-            Interest::Read => &mut entry.read,
-            Interest::Write => &mut entry.write,
-        };
-        dir.enable(waker);
+        if let Some(entry) = inner.event_sources.get_mut(handle) {
+            let dir = match interest {
+                Interest::Read => &mut entry.read,
+                Interest::Write => &mut entry.write,
+            };
+            dir.enable(waker);
+        } else {
+            log::error!(
+                "Enabling non-existent event source {{ fd = {}, id = {} }}",
+                handle.fd,
+                handle.id.0
+            );
+        }
     }
 
     fn wait(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -162,7 +171,9 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             fn drop(&mut self) {
                 self.0.pollfds.clear();
                 self.0.ids.clear();
-                let _ = self.1.clear();
+                if let Err(err) = self.1.clear() {
+                    log::error!("Error clearing notifications: {err}");
+                }
             }
         }
 
@@ -232,7 +243,9 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
     }
 
     fn clear_notifications(&self) {
-        let _ = self.notifier.clear();
+        if let Err(err) = self.notifier.clear() {
+            log::error!("Error clearing notifications: {err}");
+        }
     }
 
     fn is_empty(&self) -> bool {

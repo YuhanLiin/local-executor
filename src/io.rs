@@ -1,11 +1,19 @@
 #[cfg(unix)]
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::{
+    fd::{AsFd, BorrowedFd},
+    unix::net::UnixStream,
+};
 use std::{
+    fs::File,
     future::poll_fn,
-    io::{self, BufRead, ErrorKind, Read, Write},
+    io::{
+        self, BufRead, BufReader, BufWriter, ErrorKind, LineWriter, Read, Stderr, StderrLock,
+        Stdin, StdinLock, Stdout, StdoutLock, Write,
+    },
     marker::PhantomData,
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     pin::Pin,
+    process::{ChildStderr, ChildStdin, ChildStdout},
     task::{Context, Poll},
 };
 
@@ -15,6 +23,29 @@ use crate::{
     reactor::{EventHandle, Interest},
     Reactor, REACTOR,
 };
+
+pub unsafe trait IoSafe {}
+
+unsafe impl IoSafe for File {}
+unsafe impl IoSafe for Stderr {}
+unsafe impl IoSafe for Stdin {}
+unsafe impl IoSafe for Stdout {}
+unsafe impl IoSafe for StderrLock<'_> {}
+unsafe impl IoSafe for StdinLock<'_> {}
+unsafe impl IoSafe for StdoutLock<'_> {}
+unsafe impl IoSafe for TcpStream {}
+unsafe impl IoSafe for UdpSocket {}
+#[cfg(unix)]
+unsafe impl IoSafe for UnixStream {}
+unsafe impl IoSafe for ChildStdin {}
+unsafe impl IoSafe for ChildStderr {}
+unsafe impl IoSafe for ChildStdout {}
+unsafe impl<T: IoSafe> IoSafe for BufReader<T> {}
+unsafe impl<T: IoSafe + Write> IoSafe for BufWriter<T> {}
+unsafe impl<T: IoSafe + Write> IoSafe for LineWriter<T> {}
+unsafe impl<T: IoSafe + ?Sized> IoSafe for &mut T {}
+unsafe impl<T: IoSafe + ?Sized> IoSafe for Box<T> {}
+unsafe impl<T: ?Sized> IoSafe for &T {}
 
 // Deregisters the event handle on drop to ensure I/O safety
 struct GuardedHandle(EventHandle);
@@ -28,6 +59,7 @@ pub struct Async<T> {
     // Make sure the handle is dropped before the inner I/O type
     handle: GuardedHandle,
     inner: T,
+    // Make this both !Send and !Sync
     _phantom: PhantomData<*const ()>,
 }
 
@@ -53,12 +85,10 @@ impl<T: AsFd> Async<T> {
 
 #[cfg(unix)]
 fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
-    {
-        let previous = rustix::fs::fcntl_getfl(fd)?;
-        let new = previous | rustix::fs::OFlags::NONBLOCK;
-        if new != previous {
-            rustix::fs::fcntl_setfl(fd, new)?;
-        }
+    let previous = rustix::fs::fcntl_getfl(fd)?;
+    let new = previous | rustix::fs::OFlags::NONBLOCK;
+    if new != previous {
+        rustix::fs::fcntl_setfl(fd, new)?;
     }
     Ok(())
 }
@@ -110,7 +140,7 @@ impl<T> Async<T> {
     }
 }
 
-impl<T: Read> AsyncRead for Async<T> {
+impl<T: Read + IoSafe> AsyncRead for Async<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -133,7 +163,7 @@ where
     }
 }
 
-impl<T: Write> AsyncWrite for Async<T> {
+impl<T: Write + IoSafe> AsyncWrite for Async<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -172,7 +202,7 @@ where
     }
 }
 
-impl<T: BufRead> AsyncBufRead for Async<T> {
+impl<T: BufRead + IoSafe> AsyncBufRead for Async<T> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
         this.poll_event_mut(Interest::Read, cx, |inner| inner.fill_buf())
@@ -275,8 +305,8 @@ mod tests {
             .is_pending());
 
         block_on(async {
-            let accepted = accept.await.unwrap();
-            let conneted = connect.await.unwrap();
+            let _accepted = accept.await.unwrap();
+            let _conneted = connect.await.unwrap();
         });
 
         let mut connect = pin!(Async::<TcpStream>::connect(addr));

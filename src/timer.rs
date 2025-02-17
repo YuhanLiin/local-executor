@@ -57,20 +57,29 @@ impl TimerQueue {
     fn register(&self, expiry: Instant, waker: Waker) -> Id {
         let id = self.current_id.get();
         self.current_id.set(id.overflowing_incr());
-        self.timers.borrow_mut().insert((expiry, id), waker);
+        if self
+            .timers
+            .borrow_mut()
+            .insert((expiry, id), waker)
+            .is_some()
+        {
+            log::warn!("Timer ID collision at ID = {}", id.0);
+        }
         id
     }
 
     /// Modify the waker on an existing timer
     fn modify(&self, id: Id, expiry: Instant, waker: &Waker) {
-        // This timer could have expired already, in which case this becomes a noop
         if let Some(wk) = self.timers.borrow_mut().get_mut(&(expiry, id)) {
             wk.clone_from(waker)
+        } else {
+            log::error!("Modifying non-existent timer ID = {}", id.0);
         }
     }
 
     /// Remove a timer from the queue before it expires
     fn cancel(&self, id: Id, expiry: Instant) {
+        // This timer could have expired already, in which case this becomes a noop
         self.timers.borrow_mut().remove(&(expiry, id));
     }
 }
@@ -84,7 +93,7 @@ pub struct Timer {
     _phantom: PhantomData<*const ()>,
 }
 
-// Future can be Sync because you can't poll futures across thread boundaries anyways, since poll()
+// Future can be Sync because you can't poll timers across thread boundaries anyways, since poll()
 // takes &mut self.
 unsafe impl Sync for Timer {}
 

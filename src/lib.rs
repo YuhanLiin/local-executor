@@ -82,8 +82,8 @@ where
             return out;
         }
 
-        REACTOR
-            .with(|r| r.wait(TIMER_QUEUE.with(|q| q.next_timeout())))
-            .expect("Reactor wait failed");
+        if let Err(err) = REACTOR.with(|r| r.wait(TIMER_QUEUE.with(|q| q.next_timeout()))) {
+            log::error!("Error polling reactor: {err}");
+        }
     }
 }

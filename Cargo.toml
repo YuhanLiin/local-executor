@@ -7,3 +7,4 @@ edition = "2021"
 rustix = { version = "0.38", features = ["event", "time", "pipe", "fs", "net"] }
 pin-project-lite = "0.2.16"
 futures-io = "0.3"
+log = "0.4"
