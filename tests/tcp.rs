@@ -1,7 +1,7 @@
 use std::net::{TcpListener, TcpStream};
 
-use futures_lite::{future::zip, AsyncReadExt, AsyncWriteExt};
-use simple_executor::{block_on, io::Async};
+use futures_lite::{AsyncReadExt, AsyncWriteExt};
+use simple_executor::{block_on, io::Async, join};
 
 #[test]
 fn single_thread_echo() {
@@ -10,6 +10,7 @@ fn single_thread_echo() {
         .filter_level(log::LevelFilter::Trace)
         .try_init();
 
+    let mut done = (false, false);
     block_on(async {
         let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0)).unwrap();
         let addr = listener.get_ref().local_addr().unwrap();
@@ -25,6 +26,7 @@ fn single_thread_echo() {
                 log::info!("Task1: Write");
                 assert!(buf.iter().all(|&b| b == i));
             }
+            done.0 = true;
         };
 
         let fut2 = async {
@@ -40,9 +42,12 @@ fn single_thread_echo() {
                 log::info!("Task2: Read");
                 assert_eq!(&buf, b"hello world");
             }
+            done.1 = true;
         };
 
-        zip(fut1, fut2).await;
+        join!(fut1, fut2).await;
+        assert!(done.0);
+        assert!(done.1);
     });
 }
 
