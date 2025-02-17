@@ -17,6 +17,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures_core::Stream;
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
@@ -218,10 +219,35 @@ impl Async<TcpListener> {
         Async::new(TcpListener::bind(addr.into())?)
     }
 
+    fn poll_accept(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<(Async<TcpStream>, SocketAddr)>> {
+        self.poll_event(Interest::Read, cx, |inner| {
+            inner
+                .accept()
+                .and_then(|(st, addr)| Async::new(st).map(|st| (st, addr)))
+        })
+    }
+
     pub async fn accept(&self) -> io::Result<(Async<TcpStream>, SocketAddr)> {
-        poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.accept()))
-            .await
-            .and_then(|(st, addr)| Async::new(st).map(|st| (st, addr)))
+        poll_fn(|cx| self.poll_accept(cx)).await
+    }
+
+    pub fn incoming(&self) -> IncomingTcp {
+        IncomingTcp { listener: self }
+    }
+}
+
+pub struct IncomingTcp<'a> {
+    listener: &'a Async<TcpListener>,
+}
+
+impl Stream for IncomingTcp<'_> {
+    type Item = io::Result<(Async<TcpStream>, SocketAddr)>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.listener.poll_accept(cx).map(Some)
     }
 }
 

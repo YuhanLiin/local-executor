@@ -1,6 +1,6 @@
 use std::net::{TcpListener, TcpStream};
 
-use futures_lite::{AsyncReadExt, AsyncWriteExt};
+use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use simple_executor::{block_on, io::Async, join};
 
 #[test]
@@ -16,9 +16,10 @@ fn single_thread_echo() {
         let addr = listener.get_ref().local_addr().unwrap();
 
         let fut1 = async {
+            let mut incoming = listener.incoming();
             for i in 1..=10 {
                 let mut buf = [0u8; 1000];
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) = incoming.next().await.unwrap().unwrap();
                 log::info!("Task1: Accept");
                 stream.read_exact(&mut buf).await.unwrap();
                 log::info!("Task1: Read");
