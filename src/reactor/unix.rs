@@ -184,7 +184,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
 
         let mut borrow = self.inner.borrow_mut();
         let inner = DropGuard(&mut borrow, self.notifier.as_ref());
-        let timeout = self.timeout.set_timeout(timeout)?;
+        let poll_timeout = self.timeout.set_timeout(timeout)?;
 
         for (handle, data) in &inner.0.event_sources {
             let pollflags = data.pollflags();
@@ -206,11 +206,16 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         }
 
         log::trace!(
-            "{:?} Reactor polling {} event sources",
+            "{:?} Reactor polling {} event sources with timeout of {} microseconds",
             std::thread::current().id(),
-            inner.0.ids.len()
+            inner.0.ids.len(),
+            if let Some(t) = timeout {
+                t.as_micros() as i128
+            } else {
+                -1
+            }
         );
-        match poll(&mut inner.0.pollfds, timeout)? {
+        match poll(&mut inner.0.pollfds, poll_timeout)? {
             // If poll timed out, don't bother checking the wakers
             0 => {}
             // If the only events received are the ones without a waker, then skip the waker check

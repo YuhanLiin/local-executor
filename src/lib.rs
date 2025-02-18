@@ -17,10 +17,10 @@
 //! [`poll`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/poll.html). Currently,
 //! Windows is not supported.
 //!
-//! # Join
+//! # Concurrent tasks
 //!
 //! Unlike other async executors, this crate doesn't have an API for spawning tasks. Instead, use
-//! the [`join!`] or [`try_join`] macro to run multiple futures concurrently.
+//! the [`join!`] or [`merge_futures`] macro to run multiple tasks concurrently.
 //!
 //! # Examples
 //!
@@ -31,16 +31,17 @@
 //! use std::net::{TcpStream, TcpListener};
 //! use std::time::Duration;
 //! use std::io;
+//! use std::pin::pin;
 //!
-//! use futures_lite::{AsyncReadExt, AsyncWriteExt};
-//! use local_runtime::{io::Async, time::sleep, block_on, try_join};
+//! use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
+//! use local_runtime::{io::Async, time::sleep, block_on, merge_futures};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
 //! let addr = listener.get_ref().local_addr()?;
 //!
 //! block_on(async {
-//!     let task1 = async {
+//!     let task1 = pin!(async {
 //!         loop {
 //!             let (mut stream, _) = listener.accept().await?;
 //!             let mut buf = [0u8; 5];
@@ -48,18 +49,19 @@
 //!             assert_eq!(&buf, b"hello");
 //!         }
 //!         Ok::<_, io::Error>(())
-//!     };
+//!     });
 //!
-//!     let task2 = async {
+//!     let task2 = pin!(async {
 //!         loop {
 //!             let mut stream = Async::<TcpStream>::connect(addr).await?;
 //!             stream.write_all(b"hello").await?;
 //!             sleep(Duration::from_micros(500)).await;
 //!         }
 //!         Ok::<_, io::Error>(())
-//!     };
+//!     });
 //!
-//!     try_join!(task1, task2).await
+//!     // Process the result of each task as a stream, returning early on error
+//!     merge_futures!(task1, task2).try_for_each(|x| x).await
 //! })?;
 //! # Ok(())
 //! # }
@@ -83,7 +85,7 @@ use std::{
 use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
 use time::TIMER_QUEUE;
 
-pub use join::{JoinFuture, TryJoinFuture};
+pub use join::{JoinFuture, MergeFutureStream, MergeStream};
 
 // Option<Id> will be same size as `usize`
 #[repr(transparent)]
