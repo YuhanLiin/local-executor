@@ -526,6 +526,7 @@ mod tests {
         }};
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn eventfd_notification() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
@@ -566,7 +567,7 @@ mod tests {
 
     #[test]
     fn poll_timeout() {
-        let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
+        let reactor = PollReactor::<PipeFd, PollTimeout>::new().unwrap();
         assert_reactor_wait!(reactor, &Some(Duration::from_millis(0))).unwrap();
 
         let start = Instant::now();
@@ -579,6 +580,7 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(1));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn timerfd_timeout() {
         let reactor = PollReactor::<EventFd, TimerFd>::new().unwrap();
@@ -594,6 +596,7 @@ mod tests {
         assert!(elapsed >= Duration::from_nanos(10) && elapsed < Duration::from_millis(1));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn clear_notifier_and_timerfd() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
@@ -625,6 +628,7 @@ mod tests {
         pipe.clear().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn multiple_events() {
         const COUNT: usize = 5;
@@ -652,6 +656,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn multiple_wakes() {
         const COUNT: usize = 5;
@@ -675,6 +680,7 @@ mod tests {
         assert!(!wakers[3].get());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn modify_registration() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
@@ -700,6 +706,7 @@ mod tests {
         assert!(reactor.inner.borrow().event_sources.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn repeated_source() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
@@ -733,6 +740,7 @@ mod tests {
         assert!(!wakers[2].get());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn disable_interest_after_poll() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
@@ -756,6 +764,7 @@ mod tests {
         assert!(!wakers[1].get());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn id_overflow() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
@@ -772,6 +781,7 @@ mod tests {
         assert_eq!(handle.id.0.get(), 2);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn flag_notifier() {
         let notifier = FlagNotifier::new(EventFd::new().unwrap());

@@ -48,3 +48,18 @@ fn periodic_test() {
     });
     assert_eq!(count, 7);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn microsecond_timer() {
+    block_on(async {
+        let mut periodic = Periodic::periodic(Duration::from_micros(100));
+        for _ in 0..10 {
+            let before = Instant::now();
+            periodic.next().await;
+            let elapsed = before.elapsed();
+            assert!(elapsed > Duration::from_micros(80));
+            assert!(elapsed < Duration::from_micros(150));
+        }
+    });
+}
