@@ -67,8 +67,8 @@
 //! # }
 //! ```
 
+mod concurrency;
 pub mod io;
-mod join;
 mod reactor;
 #[cfg(test)]
 mod test;
@@ -85,7 +85,7 @@ use std::{
 use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
 use time::TIMER_QUEUE;
 
-pub use join::{JoinFuture, MergeFutureStream, MergeStream};
+pub use concurrency::{JoinFuture, MergeFutureStream, MergeStream};
 
 // Option<Id> will be same size as `usize`
 #[repr(transparent)]
