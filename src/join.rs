@@ -17,7 +17,7 @@ struct FlagWaker {
 
 impl Wake for FlagWaker {
     fn wake(self: Arc<Self>) {
-        self.awoken.store(true, Ordering::Relaxed);
+        self.set_awoken();
         self.waker.wake_by_ref();
     }
 }
@@ -34,6 +34,10 @@ impl From<Waker> for FlagWaker {
 impl FlagWaker {
     fn check_awoken(&self) -> bool {
         self.awoken.swap(false, Ordering::Relaxed)
+    }
+
+    fn set_awoken(&self) {
+        self.awoken.store(true, Ordering::Relaxed);
     }
 }
 
@@ -202,7 +206,6 @@ where
     let iter = iter_remain.chain(iter_past);
 
     for (poller_opt, waker_pair) in iter {
-        *idx = (*idx + 1) % len;
         if let Some(poller) = poller_opt {
             let (waker_data, waker) = waker_pair.get_or_insert_with(|| {
                 let waker_data = Arc::new(FlagWaker::from(cx.waker().clone()));
@@ -217,11 +220,16 @@ where
                         *none_count += 1;
                     }
                     if let Some(ret) = opt_fn(out) {
+                        // Set the awoken flag so that the next time we poll, we'll start by
+                        // polling the future/stream that just yielded a value
+                        waker_data.set_awoken();
                         return Poll::Ready(Some(ret));
                     }
                 }
             }
         }
+        // Update index
+        *idx = (*idx + 1) % len;
     }
     Poll::Pending
 }
@@ -359,7 +367,7 @@ mod tests {
 
     use crate::{
         block_on,
-        time::{sleep, timeout},
+        time::{sleep, timeout, Periodic},
     };
 
     use super::*;
@@ -482,5 +490,22 @@ mod tests {
             });
             assert_eq!(merge_futures!(a, b).collect::<Vec<_>>().await.len(), 2);
         });
+    }
+
+    #[test]
+    fn merge_periodic() {
+        use futures_lite::StreamExt;
+        use std::pin::pin;
+        use std::time::Duration;
+
+        block_on(async {
+            let a = pin!(Periodic::periodic(Duration::from_millis(14)).map(|_| 1u8));
+            let b = pin!(Periodic::periodic(Duration::from_millis(6)).map(|_| 2u8));
+            let stream = merge_streams!(a, b);
+            assert_eq!(
+                stream.take(6).collect::<Vec<_>>().await,
+                &[2, 2, 1, 2, 2, 1]
+            );
+        })
     }
 }
