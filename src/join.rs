@@ -175,7 +175,7 @@ mod tests {
 
     use crate::{
         block_on,
-        timer::{sleep, timeout},
+        time::{sleep, timeout},
     };
 
     use super::*;
