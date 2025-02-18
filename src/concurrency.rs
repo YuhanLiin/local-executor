@@ -194,9 +194,6 @@ where
     NF: FnMut(&O) -> bool,
 {
     let len = pollers.len();
-    if *none_count == len {
-        return Poll::Ready(None);
-    }
 
     let (futs_past, futs_remain) = pollers.split_at_mut(*idx);
     let (wakers_past, wakers_remain) = wakers.split_at_mut(*idx);
@@ -230,6 +227,10 @@ where
         }
         // Update index
         *idx = (*idx + 1) % len;
+        // If all the futures/streams have terminated, end the stream by returning none
+        if *none_count == len {
+            return Poll::Ready(None);
+        }
     }
     Poll::Pending
 }

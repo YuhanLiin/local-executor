@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_lite::StreamExt;
+use futures_lite::{stream, StreamExt};
 
 use local_runtime::{
     block_on, join, merge_futures, merge_streams,
@@ -135,17 +135,38 @@ fn merge_same_time() {
 
 #[test]
 fn merge_periodic() {
-    use futures_lite::StreamExt;
-    use std::pin::pin;
-    use std::time::Duration;
-
     block_on(async {
         let a = pin!(Periodic::periodic(Duration::from_millis(14)).map(|_| 1u8));
         let b = pin!(Periodic::periodic(Duration::from_millis(6)).map(|_| 2u8));
-        let stream = merge_streams!(a, b);
+        let c = pin!(stream::unfold(0, |n| async move {
+            if n < 2 {
+                sleep(Duration::from_millis(5)).await;
+                Some((3, n + 1))
+            } else {
+                None
+            }
+        }));
+        let stream = merge_streams!(a, b, c);
         assert_eq!(
-            stream.take(6).collect::<Vec<_>>().await,
-            &[2, 2, 1, 2, 2, 1]
+            stream.take(8).collect::<Vec<_>>().await,
+            &[3, 2, 3, 2, 1, 2, 2, 1]
         );
     })
+}
+
+#[test]
+fn single_entry() {
+    block_on(async {
+        assert_eq!(join!(async { 1 }).await[0], 1);
+        assert_eq!(
+            merge_futures!(pin!(async { 2 })).collect::<Vec<_>>().await,
+            &[2]
+        );
+        println!("wtf");
+        let stream = pin!(stream::iter([1, 2, 3].iter()));
+        assert_eq!(
+            merge_streams!(stream).collect::<Vec<i32>>().await,
+            &[1, 2, 3]
+        );
+    });
 }
