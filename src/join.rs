@@ -42,7 +42,7 @@ enum Inflight<'a, T> {
     Done(T),
 }
 
-impl<'a, T> Inflight<'a, T> {
+impl<T> Inflight<'_, T> {
     fn unwrap_done(self) -> T {
         match self {
             Inflight::Fut(_) => panic!("expected inflight future to be done"),
@@ -65,12 +65,68 @@ impl<'a, T, const N: usize> JoinFuture<'a, T, N> {
     }
 }
 
-fn poll_join<T>(
+impl<T: Unpin, const N: usize> Future for JoinFuture<'_, T, N> {
+    type Output = [T; N];
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        poll_join(
+            this.inflight.as_mut().unwrap(),
+            &mut this.wakers,
+            cx,
+            |_| false,
+        )
+        .map(|_| this.inflight.take().unwrap().map(Inflight::unwrap_done))
+    }
+}
+
+pub struct TryJoinFuture<'a, T, E, const N: usize>(JoinFuture<'a, Result<T, E>, N>);
+
+impl<'a, T, E, const N: usize> TryJoinFuture<'a, T, E, N> {
+    pub fn new(futures: [PinFut<'a, Result<T, E>>; N]) -> Self {
+        Self(JoinFuture::new(futures))
+    }
+}
+
+fn unwrap_err<T, E>(res: Result<T, E>) -> E {
+    let Err(err) = res else {
+        panic!("expected error")
+    };
+    err
+}
+
+impl<T: Unpin, E: Unpin, const N: usize> Future for TryJoinFuture<'_, T, E, N> {
+    type Output = Result<[T; N], E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        poll_join(
+            this.0.inflight.as_mut().unwrap(),
+            &mut this.0.wakers,
+            cx,
+            |res| res.is_err(),
+        )
+        .map(|poll_res| {
+            poll_res
+                .map(|_| {
+                    this.0.inflight.take().unwrap().map(|inflight| {
+                        inflight
+                            .unwrap_done()
+                            .unwrap_or_else(|_| panic!("unexpected error"))
+                    })
+                })
+                .map_err(unwrap_err)
+        })
+    }
+}
+
+fn poll_join<T, F: FnMut(&T) -> bool>(
     inflights: &mut [Inflight<T>],
     wakers: &mut [Option<(Arc<JoinWaker>, Waker)>],
     cx: &mut Context,
-) -> Poll<()> {
-    let mut out = Poll::Ready(());
+    mut stop_predicate: F,
+) -> Poll<Result<(), T>> {
+    let mut out = Poll::Ready(Ok(()));
     for (inflight, waker) in inflights.iter_mut().zip(wakers.iter_mut()) {
         if let Inflight::Fut(fut) = inflight {
             let (waker_data, waker) = waker.get_or_insert_with(|| {
@@ -81,24 +137,18 @@ fn poll_join<T>(
 
             if waker_data.check_awoken() {
                 if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(waker)) {
-                    *inflight = Inflight::Done(out);
-                    continue;
+                    if stop_predicate(&out) {
+                        return Poll::Ready(Err(out));
+                    } else {
+                        *inflight = Inflight::Done(out);
+                        continue;
+                    }
                 }
             }
             out = Poll::Pending;
         }
     }
     out
-}
-
-impl<T: Unpin, const N: usize> Future for JoinFuture<'_, T, N> {
-    type Output = [T; N];
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        poll_join(this.inflight.as_mut().unwrap(), &mut this.wakers, cx)
-            .map(|_| this.inflight.take().unwrap().map(Inflight::unwrap_done))
-    }
 }
 
 #[macro_export]
@@ -108,10 +158,18 @@ macro_rules! join {
     };
 }
 
+#[macro_export]
+macro_rules! try_join {
+    ($($fut:expr),+ $(,)?) => {
+        async { $crate::TryJoinFuture::new([$(std::pin::pin!($fut)),+]).await }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         cell::Cell,
+        future::pending,
         time::{Duration, Instant},
     };
 
@@ -171,5 +229,15 @@ mod tests {
             joined.await
         });
         assert_eq!(out, [5, 12]);
+    }
+
+    #[test]
+    fn try_join() {
+        let err = block_on(try_join!(
+            async { Err("error") },
+            pending::<Result<(), &str>>()
+        ))
+        .unwrap_err();
+        assert_eq!(err, "error");
     }
 }
