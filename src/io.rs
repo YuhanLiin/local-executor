@@ -350,6 +350,7 @@ impl Async<TcpListener> {
 }
 
 /// Stream returned by [`Async::<TcpListener>::incoming`]
+#[must_use = "Streams do nothing unless polled"]
 pub struct IncomingTcp<'a> {
     listener: &'a Async<TcpListener>,
 }

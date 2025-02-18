@@ -59,6 +59,7 @@ impl<T> Inflight<'_, T> {
 }
 
 #[doc(hidden)]
+#[must_use = "Futures do nothing unless polled"]
 pub struct JoinFuture<'a, T, const N: usize> {
     inflight: Option<[Inflight<'a, T>; N]>,
     wakers: [Option<(Arc<FlagWaker>, Waker)>; N],
@@ -141,6 +142,7 @@ macro_rules! join {
 }
 
 #[doc(hidden)]
+#[must_use = "Streams do nothing unless polled"]
 pub struct MergeFutureStream<'a, T, const N: usize> {
     futures: [Option<PinFut<'a, T>>; N],
     wakers: [Option<(Arc<FlagWaker>, Waker)>; N],
@@ -283,6 +285,7 @@ macro_rules! merge_futures {
 }
 
 #[doc(hidden)]
+#[must_use = "Streams do nothing unless polled"]
 pub struct MergeStream<'a, T, const N: usize> {
     streams: [Option<PinStream<'a, T>>; N],
     wakers: [Option<(Arc<FlagWaker>, Waker)>; N],

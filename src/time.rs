@@ -208,6 +208,7 @@ pub fn sleep(duration: Duration) -> Timer {
 /// }
 /// # });
 /// ```
+#[must_use = "Streams do nothing unless polled"]
 pub struct Periodic {
     timer: Timer,
     period: Duration,
@@ -234,14 +235,6 @@ impl Periodic {
     /// Change the period of the timer, effective after the next time it fires
     pub fn set_period(&mut self, period: Duration) {
         self.period = period;
-    }
-}
-
-impl Future for Periodic {
-    type Output = Instant;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.poll_next(cx).map(Option::unwrap)
     }
 }
 
