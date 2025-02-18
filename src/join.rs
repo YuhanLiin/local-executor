@@ -51,6 +51,7 @@ impl<T> Inflight<'_, T> {
     }
 }
 
+#[doc(hidden)]
 pub struct JoinFuture<'a, T, const N: usize> {
     inflight: Option<[Inflight<'a, T>; N]>,
     wakers: [Option<(Arc<JoinWaker>, Waker)>; N],
@@ -80,6 +81,7 @@ impl<T: Unpin, const N: usize> Future for JoinFuture<'_, T, N> {
     }
 }
 
+#[doc(hidden)]
 pub struct TryJoinFuture<'a, T, E, const N: usize>(JoinFuture<'a, Result<T, E>, N>);
 
 impl<'a, T, E, const N: usize> TryJoinFuture<'a, T, E, N> {
@@ -95,7 +97,10 @@ fn unwrap_err<T, E>(res: Result<T, E>) -> E {
     err
 }
 
-impl<T: Unpin, E: Unpin, const N: usize> Future for TryJoinFuture<'_, T, E, N> {
+impl<T, E, const N: usize> Future for TryJoinFuture<'_, T, E, N>
+where
+    Result<T, E>: Unpin,
+{
     type Output = Result<[T; N], E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -151,6 +156,28 @@ fn poll_join<T, F: FnMut(&T) -> bool>(
     out
 }
 
+/// Poll multiple futures concurrently, returning a future that outputs an array of all results
+/// once all futures have completed.
+///
+/// [`join`] will only poll each inner future when it is awoken, rather than polling all inner
+/// futures on each iteration.
+///
+/// # Caveat
+///
+/// The futures must all have the same output type, which must be `Unpin`.
+///
+/// # Examples
+///
+/// ```
+/// use local_runtime::join;
+///
+/// # local_runtime::block_on(async {
+/// let a = async { 1 };
+/// let b = async { 2 };
+/// let c = async { 3 };
+/// assert_eq!(join!(a, b, c).await, [1, 2, 3]);
+/// # })
+/// ```
 #[macro_export]
 macro_rules! join {
     ($($fut:expr),+ $(,)?) => {
@@ -158,6 +185,28 @@ macro_rules! join {
     };
 }
 
+/// Poll multiple futures concurrently, resolving to a [`Result`](std::result::Result) containing
+/// either an array of all results or an error.
+///
+/// Unlike [`join`], [`try_join`] will return early if any of the futures returns an error,
+/// dropping all the other futures.
+///
+/// # Caveat
+///
+/// The futures must all have the same output type, which must be `Unpin` and a
+/// [`Result`](std::result::Result).
+///
+/// # Examples
+///
+/// ```
+/// use local_runtime::try_join;
+///
+/// # local_runtime::block_on(async {
+/// let a = async { Err::<u32, i32>(-1) };
+/// let b = async { Ok::<u32, i32>(10) };
+/// assert_eq!(try_join!(a, b).await, Err(-1));
+/// # })
+/// ```
 #[macro_export]
 macro_rules! try_join {
     ($($fut:expr),+ $(,)?) => {
