@@ -37,8 +37,7 @@ use crate::{
 ///
 /// As such, functions that grant mutable access to the inner I/O object are unsafe, because they
 /// may move or drop the underlying I/O. Unfortunately, [`Async`] needs to call I/O traits such as
-/// [`Read`](std::io::Read) and [`Write`](std::io::Write) to implement the async version of those
-/// traits.
+/// [`Read`] and [`Write`] to implement the async version of those traits.
 ///
 /// To signal that those traits are safe to implement for an I/O type, it must implement
 /// [`IoSafe`], which acts as a promise that the I/O type doesn't move or drop itself in its I/O
@@ -49,8 +48,7 @@ use crate::{
 /// # Safety
 ///
 /// Implementors of [`IoSafe`] must not drop or move its underlying I/O source in its
-/// implementations of [`Read`](std::io::Read), [`Write`](std::io::Write),
-/// [`BufRead`](std::io::BufRead), and [`Seek`](std::io::Seek). Specifically, the "underlying I/O
+/// implementations of [`Read`], [`Write`], and [`BufRead`]. Specifically, the "underlying I/O
 /// source" is defined as the I/O primitive corresponding to the type's `AsFd`/`AsSocket`
 /// implementation.
 pub unsafe trait IoSafe {}
@@ -90,15 +88,13 @@ impl Drop for GuardedHandle {
 /// Async adapter for I/O types
 ///
 /// This type puts the I/O object into non-blocking mode, registers it on the reactor, and provides
-/// an async interface for it, including the [`AsyncRead`](futures_io::AsyncRead) and
-/// [`AsyncWrite`](futures_io::AsyncWrite) traits.
+/// an async interface for it, including the [`AsyncRead`] and [`AsyncWrite`] traits.
 ///
 /// # Supported types
 ///
-/// [`Async`] supports any type that implements `AsFd` or `AsSocket`, depending on the platform. This
-/// includes all standard networking types. However, `Async` should not be used with types like
-/// [`File`](std::fs::File) or [`Stdin`](std::io::stdio::Stdin), because they don't work well in
-/// non-blocking mode.
+/// [`Async`] supports any type that implements `AsFd` or `AsSocket`. This includes all standard
+/// networking types. However, `Async` should not be used with types like [`File`] or [`Stdin`],
+/// because they don't work well in non-blocking mode.
 ///
 /// # Examples
 ///
@@ -161,6 +157,7 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 }
 
 impl<T> Async<T> {
+    /// Get reference to inner I/O handle
     pub fn get_ref(&self) -> &T {
         &self.inner
     }

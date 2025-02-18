@@ -1,11 +1,16 @@
+#![warn(missing_docs)]
+
 //! Thread-local async runtime
 //!
 //! This crate provides an async runtime that runs entirely within the current thread. As such, it
-//! can run futures that are `!Send` and non-`static`. In addition, it also provides timers and
-//! an async wrapper for standard I/O types, similar to [`async-io`](https://docs.rs/async-io/latest/async_io/index.html).
+//! can run futures that are `!Send` and non-`static`.
 //!
 //! The entry point of the runtime is [`block_on`], which drives a future to completion on the
 //! current thread.
+//!
+//! In addition, This crate provides [async timers](crate::time) and an [async adapter](crate::io)
+//! for standard I/O types, similar to
+//! [`async-io`](https://docs.rs/async-io/latest/async_io/index.html).
 //!
 //! # Implementation
 //!
@@ -32,7 +37,6 @@
 //! use std::time::Duration;
 //! use std::io;
 //! use std::pin::pin;
-//!
 //! use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
 //! use local_runtime::{io::Async, time::sleep, block_on, merge_futures};
 //!
@@ -85,6 +89,7 @@ use std::{
 use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
 use time::TIMER_QUEUE;
 
+#[doc(hidden)]
 pub use concurrency::{JoinFuture, MergeFutureStream, MergeStream};
 
 // Option<Id> will be same size as `usize`

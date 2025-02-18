@@ -114,7 +114,7 @@ fn poll_join<T>(
 ///
 /// # Minimal polling
 ///
-/// [`join`] will only poll each inner future when it is awoken, rather than polling all inner
+/// This future will only poll each inner future when it is awoken, rather than polling all inner
 /// futures on each iteration.
 ///
 /// # Caveat
@@ -236,12 +236,12 @@ where
 
 /// Poll the futures concurrently and return their outputs as a stream.
 ///
-/// The stream yields `N` values, where `N` is the number of merged futures. The outputs will be
-/// returned in the order in which the futures completed.
+/// Produces a stream that yields `N` values, where `N` is the number of merged futures. The
+/// outputs will be returned in the order in which the futures completed.
 ///
 /// # Minimal polling
 ///
-/// [`merge_futures`] will only poll each inner future when it is awoken, rather than polling all
+/// This stream will only poll each inner future when it is awoken, rather than polling all
 /// inner futures on each iteration.
 ///
 /// # Pinning
@@ -320,13 +320,13 @@ impl<T, const N: usize> Stream for MergeStream<'_, T, N> {
 
 /// Run the streams concurrently and return their outputs one at a time.
 ///
-/// [`merge_streams`] produces a stream that yields the outputs of the inner streams as they become
-/// available, effectively interleaving the inner streams.
+/// Produces a stream that yields the outputs of the inner streams as they become available,
+/// effectively interleaving the inner streams.
 ///
 /// # Minimal polling
 ///
-/// [`merge_streams`] will only poll each inner stream when it is awoken, rather than polling all
-/// inner streams on each iteration.
+/// This stream will only poll each inner stream when it is awoken, rather than polling all inner
+/// streams on each iteration.
 ///
 /// # Pinning
 ///
