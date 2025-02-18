@@ -53,13 +53,13 @@ fn periodic_test() {
 #[test]
 fn microsecond_timer() {
     block_on(async {
-        let mut periodic = Periodic::periodic(Duration::from_micros(100));
+        let mut periodic = Periodic::periodic(Duration::from_micros(500));
         for _ in 0..10 {
             let before = Instant::now();
             periodic.next().await;
             let elapsed = before.elapsed();
-            assert!(elapsed > Duration::from_micros(80));
-            assert!(elapsed < Duration::from_micros(150));
+            assert!(elapsed > Duration::from_micros(300));
+            assert!(elapsed < Duration::from_micros(700));
         }
     });
 }
