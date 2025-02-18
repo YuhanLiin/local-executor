@@ -166,7 +166,8 @@ where
             return out;
         }
 
-        if let Err(err) = REACTOR.with(|r| r.wait(TIMER_QUEUE.with(|q| q.next_timeout()))) {
+        let wait_res = TIMER_QUEUE.with(|tq| REACTOR.with(|r| r.wait(tq)));
+        if let Err(err) = wait_res {
             log::error!(
                 "{:?} Error polling reactor: {err}",
                 std::thread::current().id()

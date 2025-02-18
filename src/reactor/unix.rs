@@ -22,7 +22,7 @@ use rustix::{
 
 use crate::Id;
 
-use super::{EventHandle, Interest, Notifier, Reactor};
+use super::{EventHandle, Interest, Notifier, Reactor, TimeoutProvider};
 
 fn read_flags() -> PollFlags {
     PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::PRI
@@ -166,7 +166,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         }
     }
 
-    fn wait(&self, timeout: Option<Duration>) -> io::Result<()> {
+    fn wait<TO: TimeoutProvider>(&self, timeout_provider: &TO) -> io::Result<()> {
         // Drop guard to ensure the pollfds and notifier are always cleared
         struct DropGuard<'a, N: NotifierFd>(&'a mut Inner, &'a FlagNotifier<N>);
         impl<N: NotifierFd> Drop for DropGuard<'_, N> {
@@ -182,6 +182,7 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
             }
         }
 
+        let timeout = timeout_provider.next_timeout();
         let mut borrow = self.inner.borrow_mut();
         let inner = DropGuard(&mut borrow, self.notifier.as_ref());
         let poll_timeout = self.timeout.set_timeout(timeout)?;
@@ -215,9 +216,19 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
                 -1
             }
         );
-        match poll(&mut inner.0.pollfds, poll_timeout)? {
+
+        let poll_res = poll(&mut inner.0.pollfds, poll_timeout)?;
+        // Now that we have awaken from the poll call, there's no need to send any
+        // notifications to "wake up" from the poll, so we set the notified flag to prevent
+        // our wakers from sending any notifications.
+        self.notifier.set_to_notified();
+        // Update timeout provider internal state, including any expired wakers
+        timeout_provider.update();
+
+        match poll_res {
             // If poll timed out, don't bother checking the wakers
             0 => {}
+
             // If the only events received are the ones without a waker, then skip the waker check
             n @ 1 | n @ 2
                 if inner.0.pollfds[inner.0.ids.len()..]
@@ -227,10 +238,6 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
                     == n => {}
 
             _ => {
-                // Now that we have awaken from the poll call, there's no need to send any
-                // notifications to "wake up" from the poll, so we set the notified flag to prevent
-                // our wakers from sending any notifications.
-                self.notifier.set_to_notified();
                 for (pollfd, id) in inner.0.pollfds.iter().zip(&inner.0.ids) {
                     if !pollfd.revents().is_empty() {
                         let handle = EventHandle {
@@ -530,12 +537,12 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 notifier.upgrade().unwrap().notify().unwrap();
             });
-            assert_reactor_wait!(reactor, None).unwrap();
+            assert_reactor_wait!(reactor, &None).unwrap();
         });
 
         // Now send notification before reactor starts waiting
         reactor.notifier().upgrade().unwrap().notify().unwrap();
-        assert_reactor_wait!(reactor, None).unwrap();
+        assert_reactor_wait!(reactor, &None).unwrap();
     }
 
     #[test]
@@ -549,25 +556,25 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 notifier.upgrade().unwrap().notify().unwrap();
             });
-            assert_reactor_wait!(reactor, None).unwrap();
+            assert_reactor_wait!(reactor, &None).unwrap();
         });
 
         // Now send notification before reactor starts waiting
         reactor.notifier().upgrade().unwrap().notify().unwrap();
-        assert_reactor_wait!(reactor, None).unwrap();
+        assert_reactor_wait!(reactor, &None).unwrap();
     }
 
     #[test]
     fn poll_timeout() {
         let reactor = PollReactor::<EventFd, PollTimeout>::new().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_millis(0))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_millis(0))).unwrap();
 
         let start = Instant::now();
-        assert_reactor_wait!(reactor, Some(Duration::from_millis(10))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_millis(10))).unwrap();
         assert!(start.elapsed() >= Duration::from_millis(10));
 
         let start = Instant::now();
-        assert_reactor_wait!(reactor, Some(Duration::from_nanos(10))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_nanos(10))).unwrap();
         // Expect time to round up to nearest millisecond
         assert!(start.elapsed() >= Duration::from_millis(1));
     }
@@ -575,14 +582,14 @@ mod tests {
     #[test]
     fn timerfd_timeout() {
         let reactor = PollReactor::<EventFd, TimerFd>::new().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_millis(0))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_millis(0))).unwrap();
 
         let start = Instant::now();
-        assert_reactor_wait!(reactor, Some(Duration::from_millis(10))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_millis(10))).unwrap();
         assert!(start.elapsed() >= Duration::from_millis(10));
 
         let start = Instant::now();
-        assert_reactor_wait!(reactor, Some(Duration::from_nanos(10))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_nanos(10))).unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_nanos(10) && elapsed < Duration::from_millis(1));
     }
@@ -609,7 +616,7 @@ mod tests {
         pipe.clear().unwrap();
         timerfd.set_timeout(None).unwrap();
 
-        reactor.wait(Some(Duration::from_millis(10))).unwrap();
+        reactor.wait(&Some(Duration::from_millis(10))).unwrap();
         // Check that none of the event sources actually fired
         assert!(!waker.get());
 
@@ -634,7 +641,7 @@ mod tests {
         events[0].notify().unwrap();
         events[2].notify().unwrap();
         events[4].notify().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
 
         for (i, wk) in wakers.iter().enumerate() {
             let awoken = wk.get();
@@ -660,7 +667,7 @@ mod tests {
 
         for i in [0, 1, 4] {
             events[i].notify().unwrap();
-            assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+            assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
             assert!(wakers[i].get());
         }
 
@@ -677,16 +684,16 @@ mod tests {
         let handle = unsafe { reactor.register(&event.fd) };
         reactor.enable_event(&handle, Interest::Read, &wakers[0].clone().into());
         event.notify().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(wakers[0].get());
 
         reactor.enable_event(&handle, Interest::Read, &wakers[1].clone().into());
         event.notify().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(wakers[1].get());
 
         reactor.enable_event(&handle, Interest::Read, &wakers[2].clone().into());
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(wakers[2].get());
 
         reactor.deregister(&handle);
@@ -707,7 +714,7 @@ mod tests {
         reactor.enable_event(&id3, Interest::Write, &wakers[2].clone().into());
 
         event.notify().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(wakers[0].get());
         assert!(wakers[1].get());
         assert!(wakers[2].get());
@@ -720,7 +727,7 @@ mod tests {
         reactor.enable_event(&id2, Interest::Read, &wakers[1].clone().into());
 
         event.notify().unwrap();
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(!wakers[0].get());
         assert!(wakers[1].get());
         assert!(!wakers[2].get());
@@ -737,14 +744,14 @@ mod tests {
         reactor.enable_event(&handle, Interest::Write, &wakers[1].clone().into());
 
         // Only the write event should fire
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(!wakers[0].get());
         assert!(wakers[1].get());
 
         wakers[1].set(false);
         event.notify().unwrap();
         // Reactor is not longer waiting on the write event, so only read event should fire
-        assert_reactor_wait!(reactor, Some(Duration::from_secs(1))).unwrap();
+        assert_reactor_wait!(reactor, &Some(Duration::from_secs(1))).unwrap();
         assert!(wakers[0].get());
         assert!(!wakers[1].get());
     }

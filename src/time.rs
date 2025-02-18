@@ -24,7 +24,7 @@ use std::{
 use futures_core::Stream;
 use pin_project_lite::pin_project;
 
-use crate::Id;
+use crate::{reactor::TimeoutProvider, Id};
 
 thread_local! { pub(crate) static TIMER_QUEUE: TimerQueue = const { TimerQueue::new() }; }
 
@@ -41,25 +41,6 @@ impl TimerQueue {
         Self {
             current_id: Cell::new(const { Id::new(1) }),
             timers: RefCell::new(BTreeMap::new()),
-        }
-    }
-
-    /// Remove all expired timers and return the time from now to the next timer
-    pub(crate) fn next_timeout(&self) -> Option<Duration> {
-        let mut timers = self.timers.borrow_mut();
-        loop {
-            let now = Instant::now();
-            match timers.first_entry() {
-                Some(entry) => {
-                    let expiry = entry.key().0;
-                    if expiry <= now {
-                        entry.remove().wake();
-                    } else {
-                        return Some(expiry - now);
-                    }
-                }
-                None => return None,
-            }
         }
     }
 
@@ -97,6 +78,30 @@ impl TimerQueue {
     fn cancel(&self, id: Id, expiry: Instant) {
         // This timer could have expired already, in which case this becomes a noop
         self.timers.borrow_mut().remove(&(expiry, id));
+    }
+}
+
+impl TimeoutProvider for TimerQueue {
+    fn next_timeout(&self) -> Option<Duration> {
+        let timers = self.timers.borrow();
+        let now = Instant::now();
+        timers
+            .first_key_value()
+            .map(|((expiry, _), _)| expiry.saturating_duration_since(now))
+    }
+
+    fn update(&self) {
+        let mut timers = self.timers.borrow_mut();
+        let now = Instant::now();
+        // Remove all expired timer entries and invoke their wakers
+        while let Some(entry) = timers.first_entry() {
+            let expiry = entry.key().0;
+            if expiry <= now {
+                entry.remove().wake();
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -247,8 +252,6 @@ impl Stream for Periodic {
         if let Poll::Ready(expiry) = Pin::new(&mut self.timer).poll(cx) {
             let next = expiry + self.period;
             self.timer.expiry = next;
-            // Re-register timer onto the reactor after timer expiry
-            self.timer.register(cx);
             Poll::Ready(Some(expiry))
         } else {
             Poll::Pending
@@ -361,14 +364,17 @@ mod tests {
             Instant::now() + Duration::from_millis(50),
             wakers[2].clone().into(),
         );
-        assert!(tq.next_timeout().unwrap() > Duration::from_millis(40));
+        assert_eq!(tq.next_timeout().unwrap(), Duration::ZERO);
 
+        tq.update();
+        assert!(tq.next_timeout().unwrap() > Duration::from_millis(40));
         assert!(wakers[0].get());
         assert!(wakers[1].get());
         assert!(!wakers[2].get());
 
         // After waiting, the 3rd timer should expire
         std::thread::sleep(Duration::from_millis(50));
+        tq.update();
         assert!(tq.next_timeout().is_none());
         assert!(wakers[2].get());
 
@@ -382,11 +388,13 @@ mod tests {
 
         let expiry = Instant::now() + Duration::from_millis(10);
         let id = tq.register(expiry, wakers[0].clone().into());
+        tq.update();
         assert!(tq.next_timeout().is_some());
 
         // Replace 1st waker with 2nd one, which should fire
         tq.modify(id, expiry, &wakers[1].clone().into());
         std::thread::sleep(Duration::from_millis(10));
+        tq.update();
         assert!(tq.next_timeout().is_none());
         assert!(!wakers[0].get());
         assert!(wakers[1].get());
@@ -401,10 +409,12 @@ mod tests {
 
         let expiry = Instant::now() + Duration::from_secs(10);
         let id = tq.register(expiry, waker.clone().into());
+        tq.update();
         assert!(tq.next_timeout().is_some());
 
         // After cancelling timer, the waker shouldn't fire
         tq.cancel(id, expiry);
+        tq.update();
         assert!(tq.next_timeout().is_none());
         assert!(!waker.get());
 
@@ -461,14 +471,14 @@ mod tests {
             .as_mut()
             .poll_next(&mut Context::from_waker(&waker.clone().into()))
             .is_ready());
-        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
+        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 0);
 
         std::thread::sleep(Duration::from_millis(5));
         assert!(periodic
             .as_mut()
             .poll_next(&mut Context::from_waker(&waker.clone().into()))
             .is_ready());
-        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
+        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 0);
     }
 
     #[test]

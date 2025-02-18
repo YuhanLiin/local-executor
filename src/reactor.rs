@@ -44,7 +44,7 @@ pub(crate) trait Reactor {
     fn enable_event(&self, handle: &EventHandle, interest: Interest, waker: &Waker);
 
     /// Wait for an event on the reactor with an optional timeout, then clears all event sources.
-    fn wait(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn wait<TO: TimeoutProvider>(&self, timeout: &TO) -> io::Result<()>;
 
     /// Return a handle to a notifier object that can be used to wake up the reactor.
     fn notifier(&self) -> Weak<Self::Notifier>;
@@ -58,6 +58,20 @@ pub(crate) trait Reactor {
 /// Object that wakes up the reactor
 pub(crate) trait Notifier {
     fn notify(&self) -> io::Result<()>;
+}
+
+pub(crate) trait TimeoutProvider {
+    fn next_timeout(&self) -> Option<Duration>;
+
+    fn update(&self);
+}
+
+impl TimeoutProvider for Option<Duration> {
+    fn next_timeout(&self) -> Option<Duration> {
+        *self
+    }
+
+    fn update(&self) {}
 }
 
 #[cfg(unix)]
