@@ -1,9 +1,71 @@
+//! Thread-local async runtime
+//!
+//! This crate provides an async runtime that runs entirely within the current thread. As such, it
+//! can run futures that are `!Send` and non-`static`. In addition, it also provides timers and
+//! an async wrapper for standard I/O types, similar to [`async-io`](https://docs.rs/async-io/latest/async_io/index.html).
+//!
+//! The entry point of the runtime is [`block_on`], which drives a future to completion on the
+//! current thread.
+//!
+//! # Implementation
+//!
+//! Task wakeups are handled by a thread-local reactor, which keeps track of all I/O events and
+//! timers in the current thread along with their associated wakers. Waiting for the reactor is
+//! done by [`block_on`], without needing a separate thread.
+//!
+//! The implementation of the reactor depends on the platform. On Unix systems, the reactor uses
+//! [`poll`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/poll.html). Currently,
+//! Windows is not supported.
+//!
+//! # Join
+//!
+//! Unlike other async executors, this crate doesn't have an API for spawning tasks. Instead, use
+//! the [`join!`] or [`try_join`] macro to run multiple futures concurrently.
+//!
+//! # Examples
+//!
+//! Concurrently listen for connections on a local port while making connections to localhost with
+//! a 500 microsecond delay. Return with error if any operation fails.
+//!
+//! ```no_run
+//! use std::net::{TcpStream, TcpListener};
+//! use std::time::Duration;
+//! use std::io;
+//!
+//! use local_runtime::{io::Async, time::sleep, block_on, try_join};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+//! let addr = listener.get_ref().local_addr()?;
+//!
+//! block_on(async {
+//!     let task1 = async {
+//!         loop {
+//!             let (_stream, _) = listener.accept().await?;
+//!         }
+//!         Ok::<_, io::Error>(())
+//!     };
+//!
+//!     let task2 = async {
+//!         loop {
+//!             let _stream = Async::<TcpStream>::connect(addr).await?;
+//!             sleep(Duration::from_micros(500)).await;
+//!         }
+//!         Ok::<_, io::Error>(())
+//!     };
+//!
+//!     try_join!(task1, task2).await
+//! })?;
+//! # Ok(())
+//! # }
+//! ```
+
 pub mod io;
 mod join;
 mod reactor;
 #[cfg(test)]
 mod test;
-pub mod timer;
+pub mod time;
 
 use std::{
     future::Future,
@@ -14,9 +76,9 @@ use std::{
 };
 
 use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
-use timer::TIMER_QUEUE;
+use time::TIMER_QUEUE;
 
-pub use join::JoinFuture;
+pub use join::{JoinFuture, TryJoinFuture};
 
 // Option<Id> will be same size as `usize`
 #[repr(transparent)]
@@ -72,6 +134,18 @@ unsafe fn wake(ptr: *const ()) {
     waker_drop(ptr);
 }
 
+/// Drives a future to completion on the current thread, processing I/O events when idle.
+///
+/// # Example
+///
+/// ```
+/// use std::time::Duration;
+/// use local_runtime::time::Timer;
+///
+/// local_runtime::block_on(async {
+///     Timer::delay(Duration::from_millis(10)).await;
+/// });
+/// ```
 pub fn block_on<T, F>(mut fut: F) -> T
 where
     F: Future<Output = T>,
