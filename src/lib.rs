@@ -32,6 +32,7 @@
 //! use std::time::Duration;
 //! use std::io;
 //!
+//! use futures_lite::{AsyncReadExt, AsyncWriteExt};
 //! use local_runtime::{io::Async, time::sleep, block_on, try_join};
 //!
 //! # fn main() -> std::io::Result<()> {
@@ -41,14 +42,18 @@
 //! block_on(async {
 //!     let task1 = async {
 //!         loop {
-//!             let (_stream, _) = listener.accept().await?;
+//!             let (mut stream, _) = listener.accept().await?;
+//!             let mut buf = [0u8; 5];
+//!             stream.read_exact(&mut buf).await?;
+//!             assert_eq!(&buf, b"hello");
 //!         }
 //!         Ok::<_, io::Error>(())
 //!     };
 //!
 //!     let task2 = async {
 //!         loop {
-//!             let _stream = Async::<TcpStream>::connect(addr).await?;
+//!             let mut stream = Async::<TcpStream>::connect(addr).await?;
+//!             stream.write_all(b"hello").await?;
 //!             sleep(Duration::from_micros(500)).await;
 //!         }
 //!         Ok::<_, io::Error>(())

@@ -1,9 +1,20 @@
+//! Async timekeeping
+//!
+//! See [`Timer`], [`Periodic`], and [`timeout`].
+//!
+//! # Precision
+//!
+//! There's a limit on the precision of the timers, depending on the platform. For example, on
+//! Unix platforms without `timerfd` support, the maximum precision is 1 millisecond. This can lead
+//! to the timer sleeping for longer than the requested duration, but it will never sleep for less.
+
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     error::Error,
     fmt::Display,
     future::Future,
+    io,
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll, Waker},
@@ -89,7 +100,20 @@ impl TimerQueue {
     }
 }
 
-/// Async timer
+/// One-shot async timer.
+///
+/// Implements `Future`.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use local_runtime::time::Timer;
+///
+/// # local_runtime::block_on(async {
+/// Timer::delay(Duration::from_secs(5)).await;
+/// # });
+/// ```
 #[derive(Debug)]
 #[must_use = "Futures do nothing unless polled"]
 pub struct Timer {
@@ -104,7 +128,7 @@ pub struct Timer {
 unsafe impl Sync for Timer {}
 
 impl Timer {
-    /// Timer that expires at a point in time
+    /// Timer that expires at a set point in time
     pub fn at(expiry: Instant) -> Self {
         Timer {
             expiry,
@@ -153,16 +177,39 @@ impl Drop for Timer {
     }
 }
 
+/// Sleep asynchronously for a set duration
 pub fn sleep(duration: Duration) -> Timer {
     Timer::delay(duration)
 }
 
+/// Periodic async timer that fires at an interval.
+///
+/// Implements `Stream` for continuous events and `Future` for just the next event. The `Stream`
+/// implementation never yields `None`, so the stream never ends.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use local_runtime::time::Periodic;
+/// use futures_lite::StreamExt;
+///
+/// # local_runtime::block_on(async {
+/// let mut periodic = Periodic::periodic(Duration::from_secs(1));
+/// loop {
+///     // Print to screen once every second
+///     periodic.next().await;
+///     println!("One second has passed");
+/// }
+/// # });
+/// ```
 pub struct Periodic {
     timer: Timer,
     period: Duration,
 }
 
 impl Periodic {
+    /// Timer that fires periodically
     #[allow(clippy::self_named_constructors)]
     pub fn periodic(period: Duration) -> Self {
         Self {
@@ -171,6 +218,7 @@ impl Periodic {
         }
     }
 
+    /// Timer that fires periodically, starting from a set point in time
     pub fn periodic_at(start: Instant, period: Duration) -> Self {
         Self {
             timer: Timer::at(start),
@@ -178,6 +226,7 @@ impl Periodic {
         }
     }
 
+    /// Change the period of the timer, effective after the next time it fires
     pub fn set_period(&mut self, period: Duration) {
         self.period = period;
     }
@@ -207,6 +256,7 @@ impl Stream for Periodic {
     }
 }
 
+/// Error returned from [`timeout`]
 #[derive(Debug)]
 pub struct TimedOut(());
 impl Display for TimedOut {
@@ -216,7 +266,14 @@ impl Display for TimedOut {
 }
 impl Error for TimedOut {}
 
+impl From<TimedOut> for io::Error {
+    fn from(_: TimedOut) -> Self {
+        io::Error::from(io::ErrorKind::TimedOut)
+    }
+}
+
 pin_project! {
+    /// Future produced by [`timeout`]
     #[derive(Debug)]
     #[must_use = "Futures do nothing unless polled"]
     pub struct Timeout<F> {
@@ -241,7 +298,26 @@ impl<F: Future> Future for Timeout<F> {
     }
 }
 
-/// Run the future with a timeout, cancelling it if it doesn't complete in time
+/// Run the future with a timeout, cancelling it if it doesn't complete in time.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use std::net::{ToSocketAddrs, TcpStream};
+/// use local_runtime::{io::Async, time::timeout};
+///
+/// let addr = "example.com:80".to_socket_addrs().unwrap().next().unwrap();
+///
+/// local_runtime::block_on(async {
+///     match timeout(async {
+///         Async::<TcpStream>::connect(addr).await.unwrap()
+///     }, Duration::from_secs(10)).await {
+///         Ok(stream) => println!("Connected"),
+///         Err(_) => eprintln!("Timed out")
+///     }
+/// });
+/// ```
 pub fn timeout<F: Future>(fut: F, timeout: Duration) -> Timeout<F> {
     Timeout {
         timer: Timer::delay(timeout),
@@ -249,7 +325,9 @@ pub fn timeout<F: Future>(fut: F, timeout: Duration) -> Timeout<F> {
     }
 }
 
-/// Run the future until a point in time, cancelling it if it doesn't complete in time
+/// Run the future until a point in time, cancelling it if it doesn't complete in time.
+///
+/// See [`timeout`] for more details.
 pub fn timeout_at<F: Future>(fut: F, expiry: Instant) -> Timeout<F> {
     Timeout {
         timer: Timer::at(expiry),
