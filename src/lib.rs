@@ -3,7 +3,8 @@
 //! Thread-local async runtime
 //!
 //! This crate provides an async runtime that runs entirely within the current thread. As such, it
-//! can run futures that are `!Send` and non-`static`.
+//! can run futures that are `!Send` and non-`static`. If no future is able to make progress, the
+//! runtime will suspend the current thread until a future is ready to be polled.
 //!
 //! The entry point of the runtime is [`block_on`], which drives a future to completion on the
 //! current thread.
