@@ -19,7 +19,7 @@ fn single_thread_echo() {
             let mut incoming = listener.incoming();
             for i in 1..=10 {
                 let mut buf = [0u8; 1000];
-                let (mut stream, _) = incoming.next().await.unwrap().unwrap();
+                let mut stream = incoming.next().await.unwrap().unwrap();
                 log::info!("Task1: Accept");
                 stream.read_exact(&mut buf).await.unwrap();
                 log::info!("Task1: Read");

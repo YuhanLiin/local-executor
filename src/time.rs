@@ -302,6 +302,8 @@ impl<F: Future> Future for Timeout<F> {
 ///
 /// # Example
 ///
+/// Try to connect to `example.com:80` with a 10 second timeout
+///
 /// ```no_run
 /// use std::time::Duration;
 /// use std::net::{ToSocketAddrs, TcpStream};

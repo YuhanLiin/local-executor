@@ -1,3 +1,7 @@
+//! Async I/O primitives
+//!
+//! See [`Async`] for more details.
+
 #[cfg(unix)]
 use std::os::{
     fd::{AsFd, BorrowedFd},
@@ -25,6 +29,30 @@ use crate::{
     Reactor, REACTOR,
 };
 
+/// Types whose I/O trait implementations do not move or drop the underlying I/O object
+///
+/// The I/O object inside [`Async`] cannot be closed before the [`Async`] is dropped, because
+/// `[Async]` deregisters the I/O object from the reactor on drop. Closing the I/O before
+/// deregistering leads to the reactor holding a dangling I/O handle, which violates I/O safety.
+///
+/// As such, functions that grant mutable access to the inner I/O object are unsafe, because they
+/// may move or drop the underlying I/O. Unfortunately, [`Async`] needs to call I/O traits such as
+/// [`Read`](std::io::Read) and [`Write`](std::io::Write) to implement the async version of those
+/// traits.
+///
+/// To signal that those traits are safe to implement for an I/O type, it must implement
+/// [`IoSafe`], which acts as a promise that the I/O type doesn't move or drop itself in its I/O
+/// trait implementations.
+///
+/// This trait is implemented for `std` I/O types.
+///
+/// # Safety
+///
+/// Implementors of [`IoSafe`] must not drop or move its underlying I/O source in its
+/// implementations of [`Read`](std::io::Read), [`Write`](std::io::Write),
+/// [`BufRead`](std::io::BufRead), and [`Seek`](std::io::Seek). Specifically, the "underlying I/O
+/// source" is defined as the I/O primitive corresponding to the type's `AsFd`/`AsSocket`
+/// implementation.
 pub unsafe trait IoSafe {}
 
 unsafe impl IoSafe for File {}
@@ -46,7 +74,10 @@ unsafe impl<T: IoSafe + Write> IoSafe for BufWriter<T> {}
 unsafe impl<T: IoSafe + Write> IoSafe for LineWriter<T> {}
 unsafe impl<T: IoSafe + ?Sized> IoSafe for &mut T {}
 unsafe impl<T: IoSafe + ?Sized> IoSafe for Box<T> {}
-unsafe impl<T: ?Sized> IoSafe for &T {}
+
+/// [`IoSafe`] cannot be unconditionally implemented for references, because non-mutable references
+/// can still drop or move internal fields via interior mutability.
+unsafe impl<T: IoSafe + ?Sized> IoSafe for &T {}
 
 // Deregisters the event handle on drop to ensure I/O safety
 struct GuardedHandle(EventHandle);
@@ -56,6 +87,32 @@ impl Drop for GuardedHandle {
     }
 }
 
+/// Async adapter for I/O types
+///
+/// This type puts the I/O object into non-blocking mode, registers it on the reactor, and provides
+/// an async interface for it, including the [`AsyncRead`](futures_io::AsyncRead) and
+/// [`AsyncWrite`](futures_io::AsyncWrite) traits.
+///
+/// # Supported types
+///
+/// [`Async`] supports any type that implements `AsFd` or `AsSocket`, depending on the platform. This
+/// includes all standard networking types. However, `Async` should not be used with types like
+/// [`File`](std::fs::File) or [`Stdin`](std::io::stdio::Stdin), because they don't work well in
+/// non-blocking mode.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::net::TcpStream;
+/// use local_runtime::io::Async;
+/// use futures_lite::AsyncWriteExt;
+///
+/// # local_runtime::block_on(async {
+/// let mut stream = Async::<TcpStream>::connect(([127, 0, 0, 1], 8000)).await?;
+/// stream.write_all(b"hello").await?;
+/// # Ok::<_, std::io::Error>(())
+/// # });
+/// ```
 pub struct Async<T> {
     // Make sure the handle is dropped before the inner I/O type
     handle: GuardedHandle,
@@ -68,6 +125,12 @@ impl<T> Unpin for Async<T> {}
 
 #[cfg(unix)]
 impl<T: AsFd> Async<T> {
+    /// Create a new async adapter around the I/O object without setting it to non-blocking mode.
+    ///
+    /// This will register the I/O object onto the reactor.
+    ///
+    /// The caller must ensure the I/O object has already been set to non-blocking mode. Otherwise
+    /// it may block the async runtime, preventing other futures from executing on the same thread.
     pub fn without_nonblocking(inner: T) -> Self {
         // SAFETY: GuardedHandle's Drop impl will deregister the FD
         let handle = GuardedHandle(unsafe { REACTOR.with(|r| r.register(&inner)) });
@@ -78,6 +141,9 @@ impl<T: AsFd> Async<T> {
         }
     }
 
+    /// Create a new async adapter around the I/O object.
+    ///
+    /// This will set the I/O object to non-blocking mode and register it onto the reactor.
     pub fn new(inner: T) -> io::Result<Self> {
         set_nonblocking(inner.as_fd())?;
         Ok(Self::without_nonblocking(inner))
@@ -153,7 +219,7 @@ impl<T: Read + IoSafe> AsyncRead for Async<T> {
 
 impl<'a, T> AsyncRead for &'a Async<T>
 where
-    &'a T: Read,
+    &'a T: Read + IoSafe,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -184,7 +250,7 @@ impl<T: Write + IoSafe> AsyncWrite for Async<T> {
 
 impl<'a, T> AsyncWrite for &'a Async<T>
 where
-    &'a T: Write,
+    &'a T: Write + IoSafe,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -215,6 +281,19 @@ impl<T: BufRead + IoSafe> AsyncBufRead for Async<T> {
 }
 
 impl Async<TcpListener> {
+    /// Create a TCP listener bound to a specific address
+    ///
+    /// # Example
+    ///
+    /// Bind the TCP listener to an OS-assigned port at 127.0.0.1.
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    /// use local_runtime::io::Async;
+    ///
+    /// let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+    /// # Ok::<_, std::io::Error>(())
+    /// ```
     pub fn bind<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         Async::new(TcpListener::bind(addr.into())?)
     }
@@ -230,28 +309,77 @@ impl Async<TcpListener> {
         })
     }
 
+    /// Accept a new incoming TCP connection from this listener
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+    /// let (stream, addr) = listener.accept().await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
     pub async fn accept(&self) -> io::Result<(Async<TcpStream>, SocketAddr)> {
         poll_fn(|cx| self.poll_accept(cx)).await
     }
 
+    /// Return a stream of incoming TCP connections
+    ///
+    /// The returned stream will never return `None`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    /// use local_runtime::io::Async;
+    /// use futures_lite::StreamExt;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+    /// let mut incoming = listener.incoming();
+    /// while let Some(stream) = incoming.next().await {
+    ///     let stream = stream?;
+    /// }
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
     pub fn incoming(&self) -> IncomingTcp {
         IncomingTcp { listener: self }
     }
 }
 
+/// Stream returned by [`Async::<TcpListener>::incoming`]
 pub struct IncomingTcp<'a> {
     listener: &'a Async<TcpListener>,
 }
 
 impl Stream for IncomingTcp<'_> {
-    type Item = io::Result<(Async<TcpStream>, SocketAddr)>;
+    type Item = io::Result<Async<TcpStream>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.listener.poll_accept(cx).map(Some)
+        self.listener
+            .poll_accept(cx)
+            .map(|pair| pair.map(|(st, _)| st))
+            .map(Some)
     }
 }
 
 impl Async<TcpStream> {
+    /// Create a TCP connection to the specified address
+    ///
+    /// ```no_run
+    /// use std::net::TcpStream;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let listener = Async::<TcpStream>::connect(([127, 0, 0, 1], 8000)).await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         let addr = addr.into();
         let stream = Async::without_nonblocking(tcp_socket(&addr)?);
@@ -259,6 +387,9 @@ impl Async<TcpStream> {
         Ok(stream)
     }
 
+    /// Reads data from the stream without removing it from the buffer.
+    ///
+    /// Returns the number of bytes read. Successive calls of this method read the same data.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.peek(buf))).await
     }
