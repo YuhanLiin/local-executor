@@ -133,6 +133,8 @@ fn merge_same_time() {
     });
 }
 
+// Requires too much precision for poll-timeout based implementation
+#[cfg(target_os = "linux")]
 #[test]
 fn merge_periodic() {
     block_on(async {
