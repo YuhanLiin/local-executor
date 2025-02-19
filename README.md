@@ -1,5 +1,5 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/YuhanLiin/local-runtime/ci.yml)
-[![docs.rs](https://img.shields.io/docsrs/local-runtime)](https://docs.rs/local-runtime/latest/local-runtime)
+[![docs.rs](https://img.shields.io/docsrs/local-runtime)](https://docs.rs/local-runtime/latest)
 [![Crates.io Version](https://img.shields.io/crates/v/local-runtime)](https://crates.io/crates/local-runtime)
 
 # local-runtime
