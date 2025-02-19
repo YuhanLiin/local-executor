@@ -43,6 +43,9 @@ pub(crate) trait Reactor {
     /// Enable a registered event source.
     fn enable_event(&self, handle: &EventHandle, interest: Interest, waker: &Waker);
 
+    /// Check if an event is ready since the last time `enable_event` was called
+    fn is_event_ready(&self, handle: &EventHandle, interest: Interest) -> bool;
+
     /// Wait for an event on the reactor with an optional timeout, then clears all event sources.
     fn wait<TO: TimeoutProvider>(&self, timeout: &TO) -> io::Result<()>;
 

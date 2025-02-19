@@ -212,6 +212,29 @@ impl<T> Async<T> {
         REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
         Poll::Pending
     }
+
+    async fn wait_for_event_ready(&self, interest: Interest) {
+        let mut first_call = true;
+        poll_fn(|cx| {
+            if first_call {
+                first_call = false;
+                // First enable the event
+                REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
+                Poll::Pending
+            } else {
+                // Then, check if the event is ready
+                match REACTOR.with(|r| r.is_event_ready(&self.handle.0, interest)) {
+                    true => Poll::Ready(()),
+                    // If not, then update the event waker
+                    false => {
+                        REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
+                        Poll::Pending
+                    }
+                }
+            }
+        })
+        .await
+    }
 }
 
 impl<T: Read + IoSafe> AsyncRead for Async<T> {
@@ -391,7 +414,13 @@ impl Async<TcpStream> {
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         let addr = addr.into();
         let stream = Async::without_nonblocking(tcp_socket(&addr)?);
-        poll_fn(|cx| stream.poll_event(Interest::Write, cx, |inner| connect(inner, &addr))).await?;
+
+        // Initiate the connection
+        connect(&stream.inner, &addr)?;
+        // Wait for the stream to be writable
+        stream.wait_for_event_ready(Interest::Write).await;
+        // Check for errors
+        stream.inner.peer_addr()?;
         Ok(stream)
     }
 
@@ -422,7 +451,7 @@ fn tcp_socket(addr: &SocketAddr) -> io::Result<TcpStream> {
 fn connect(tcp: &TcpStream, addr: &SocketAddr) -> io::Result<()> {
     match rustix::net::connect(tcp.as_fd(), addr) {
         Ok(()) => Ok(()),
-        Err(rustix::io::Errno::INPROGRESS) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Err(rustix::io::Errno::INPROGRESS | rustix::io::Errno::WOULDBLOCK) => Ok(()),
         Err(err) => Err(err.into()),
     }
 }
@@ -466,7 +495,7 @@ mod tests {
         let mut connect = pin!(Async::<TcpStream>::connect(addr));
         assert!(connect
             .as_mut()
-            .poll(&mut Context::from_waker(&accept_waker.clone().into()))
+            .poll(&mut Context::from_waker(&connect_waker.clone().into()))
             .is_pending());
 
         block_on(async {

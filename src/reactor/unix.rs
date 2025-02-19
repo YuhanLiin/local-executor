@@ -170,6 +170,25 @@ impl<N: NotifierFd + 'static, T: Timeout> Reactor for PollReactor<N, T> {
         }
     }
 
+    fn is_event_ready(&self, handle: &EventHandle, interest: Interest) -> bool {
+        let inner = self.inner.borrow();
+        if let Some(entry) = inner.event_sources.get(handle) {
+            let dir = match interest {
+                Interest::Read => &entry.read,
+                Interest::Write => &entry.write,
+            };
+            !dir.enabled
+        } else {
+            log::error!(
+                "{:?} Checking non-existent event source {{ fd = {}, id = {} }}",
+                std::thread::current().id(),
+                handle.fd,
+                handle.id.0
+            );
+            false
+        }
+    }
+
     fn wait<TO: TimeoutProvider>(&self, timeout_provider: &TO) -> io::Result<()> {
         // Drop guard to ensure the pollfds and notifier are always cleared
         struct DropGuard<'a, N: NotifierFd>(&'a mut Inner, &'a FlagNotifier<N>);
