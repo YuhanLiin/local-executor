@@ -96,6 +96,14 @@ impl Drop for GuardedHandle {
 /// networking types. However, `Async` should not be used with types like [`File`] or [`Stdin`],
 /// because they don't work well in non-blocking mode.
 ///
+/// # Concurrency
+///
+/// Most operations on [`Async`] take `&self`, so tasks can access it concurrently. However, only
+/// one task can read at a time, and only one task can write at a time. It is fine to have one task
+/// reading while another one writes, but it is not fine to have multiple tasks reading or multiple
+/// tasks writing. Doing so will lead to wakers being lost, which can prevent tasks from waking up
+/// properly.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -147,7 +155,7 @@ impl<T: AsFd> Async<T> {
 }
 
 #[cfg(unix)]
-fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
     let previous = rustix::fs::fcntl_getfl(fd)?;
     let new = previous | rustix::fs::OFlags::NONBLOCK;
     if new != previous {
@@ -157,7 +165,7 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_nonblocking_and_cloexec(fd: BorrowedFd<'_>) -> io::Result<()> {
+pub(crate) fn set_nonblocking_and_cloexec(fd: BorrowedFd) -> io::Result<()> {
     let previous = rustix::fs::fcntl_getfl(fd)?;
     let new = previous | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
     if new != previous {
@@ -177,10 +185,10 @@ impl<T> Async<T> {
         self.inner
     }
 
-    fn poll_event<'a, P, F>(
+    unsafe fn poll_event<'a, P, F>(
         &'a self,
         interest: Interest,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         f: F,
     ) -> Poll<io::Result<P>>
     where
@@ -195,10 +203,10 @@ impl<T> Async<T> {
         Poll::Pending
     }
 
-    fn poll_event_mut<'a, P, F>(
+    unsafe fn poll_event_mut<'a, P, F>(
         &'a mut self,
         interest: Interest,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         f: F,
     ) -> Poll<io::Result<P>>
     where
@@ -211,6 +219,115 @@ impl<T> Async<T> {
         }
         REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
         Poll::Pending
+    }
+
+    /// Perform a single non-blocking read operation
+    ///
+    /// The underlying I/O object is read by the `f` closure once. If the result is
+    /// [`io::ErrorKind::WouldBlock`], then this method returns [`Poll::Pending`] and tells the
+    /// reactor to notify the context `cx` when the I/O object becomes readable.
+    ///
+    /// The closure should not perform multiple I/O operations, such as calling
+    /// [`Write::write_all`]. This is because the closure is restarted for each poll, so the
+    /// first I/O operation will be repeated and the subsequent operations won't be completed.
+    ///
+    /// # Safety
+    ///
+    /// The closure must not drop the underlying I/O object.
+    ///
+    /// # Example
+    ///
+    /// The non-blocking read operation can be converted into a future by wrapping this method in
+    /// [`poll_fn`].
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    /// use std::future::poll_fn;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let mut listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+    /// // Accept connections asynchronously
+    /// let (stream, addr) = poll_fn(|cx| unsafe { listener.poll_read_with(cx, |l| l.accept()) }).await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub unsafe fn poll_read_with<'a, P, F>(&'a self, cx: &mut Context, f: F) -> Poll<io::Result<P>>
+    where
+        F: FnOnce(&'a T) -> io::Result<P>,
+    {
+        self.poll_event(Interest::Read, cx, f)
+    }
+
+    /// Same as [`Self::poll_read_with`], but takes a mutable reference in the closure
+    ///
+    /// # Safety
+    ///
+    /// The closure must not drop the underlying I/O object.
+    pub unsafe fn poll_read_with_mut<'a, P, F>(
+        &'a mut self,
+        cx: &mut Context,
+        f: F,
+    ) -> Poll<io::Result<P>>
+    where
+        F: FnOnce(&'a mut T) -> io::Result<P>,
+    {
+        self.poll_event_mut(Interest::Read, cx, f)
+    }
+
+    /// Perform a single non-blocking write operation
+    ///
+    /// The underlying I/O object is write by the `f` closure once. If the result is
+    /// [`io::ErrorKind::WouldBlock`], then this method returns [`Poll::Pending`] and tells the
+    /// reactor to notify the context `cx` when the I/O object becomes writable.
+    ///
+    /// The closure should not perform multiple I/O operations, such as calling
+    /// [`Write::write_all`]. This is because the closure is restarted for each poll, so the
+    /// first I/O operation will be repeated and the subsequent operations won't be completed.
+    ///
+    /// # Safety
+    ///
+    /// The closure must not drop the underlying I/O object.
+    ///
+    /// # Example
+    ///
+    /// The non-blocking write operation can be converted into a future by wrapping this method in
+    /// [`poll_fn`].
+    ///
+    /// ```no_run
+    /// use std::net::TcpStream;
+    /// use std::future::poll_fn;
+    /// use std::io::Write;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let mut stream = Async::<TcpStream>::connect(([127, 0, 0, 1], 8000)).await?;
+    /// // Write some data asynchronously
+    /// poll_fn(|cx| unsafe { stream.poll_write_with(cx, |mut s| s.write(b"hello")) }).await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub unsafe fn poll_write_with<'a, P, F>(&'a self, cx: &mut Context, f: F) -> Poll<io::Result<P>>
+    where
+        F: FnOnce(&'a T) -> io::Result<P>,
+    {
+        self.poll_event(Interest::Write, cx, f)
+    }
+
+    /// Same as [`Self::poll_write_with`], but takes a mutable reference in the closure
+    ///
+    /// # Safety
+    ///
+    /// The closure must not drop the underlying I/O object.
+    pub unsafe fn poll_write_with_mut<'a, P, F>(
+        &'a mut self,
+        cx: &mut Context,
+        f: F,
+    ) -> Poll<io::Result<P>>
+    where
+        F: FnOnce(&'a mut T) -> io::Result<P>,
+    {
+        self.poll_event_mut(Interest::Write, cx, f)
     }
 
     async fn wait_for_event_ready(&self, interest: Interest) {
@@ -235,15 +352,26 @@ impl<T> Async<T> {
         })
         .await
     }
+
+    /// Waits until the I/O object is available to write without blocking
+    pub async fn writable(&self) {
+        self.wait_for_event_ready(Interest::Write).await
+    }
+
+    /// Waits until the I/O object is available to read without blocking
+    pub async fn readable(&self) {
+        self.wait_for_event_ready(Interest::Read).await
+    }
 }
 
 impl<T: Read + IoSafe> AsyncRead for Async<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_event_mut(Interest::Read, cx, |inner| inner.read(buf))
+        // Safety: IoSafe is implemented
+        unsafe { self.poll_event_mut(Interest::Read, cx, |inner| inner.read(buf)) }
     }
 }
 
@@ -253,27 +381,30 @@ where
 {
     fn poll_read(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_event(Interest::Read, cx, |mut inner| inner.read(buf))
+        // Safety: IoSafe is implemented
+        unsafe { self.poll_event(Interest::Read, cx, |mut inner| inner.read(buf)) }
     }
 }
 
 impl<T: Write + IoSafe> AsyncWrite for Async<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_event_mut(Interest::Write, cx, |inner| inner.write(buf))
+        // Safety: IoSafe is implemented
+        unsafe { self.poll_event_mut(Interest::Write, cx, |inner| inner.write(buf)) }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_event_mut(Interest::Write, cx, |inner| inner.flush())
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        // Safety: IoSafe is implemented
+        unsafe { self.poll_event_mut(Interest::Write, cx, |inner| inner.flush()) }
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         self.poll_flush(cx)
     }
 }
@@ -282,27 +413,26 @@ impl<'a, T> AsyncWrite for &'a Async<T>
 where
     &'a T: Write + IoSafe,
 {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.poll_event(Interest::Write, cx, |mut inner| inner.write(buf))
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        // Safety: IoSafe is implemented
+        unsafe { self.poll_event(Interest::Write, cx, |mut inner| inner.write(buf)) }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_event(Interest::Write, cx, |mut inner| inner.flush())
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        // Safety: IoSafe is implemented
+        unsafe { self.poll_event(Interest::Write, cx, |mut inner| inner.flush()) }
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         self.poll_flush(cx)
     }
 }
 
 impl<T: BufRead + IoSafe> AsyncBufRead for Async<T> {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
-        this.poll_event_mut(Interest::Read, cx, |inner| inner.fill_buf())
+        // Safety: IoSafe is implemented
+        unsafe { this.poll_event_mut(Interest::Read, cx, |inner| inner.fill_buf()) }
     }
 
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
@@ -328,15 +458,15 @@ impl Async<TcpListener> {
         Async::new(TcpListener::bind(addr.into())?)
     }
 
-    fn poll_accept(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<(Async<TcpStream>, SocketAddr)>> {
-        self.poll_event(Interest::Read, cx, |inner| {
-            inner
-                .accept()
-                .and_then(|(st, addr)| Async::new(st).map(|st| (st, addr)))
-        })
+    fn poll_accept(&self, cx: &mut Context) -> Poll<io::Result<(Async<TcpStream>, SocketAddr)>> {
+        // Safety: accept() is I/O safe
+        unsafe {
+            self.poll_event(Interest::Read, cx, |inner| {
+                inner
+                    .accept()
+                    .and_then(|(st, addr)| Async::new(st).map(|st| (st, addr)))
+            })
+        }
     }
 
     /// Accept a new incoming TCP connection from this listener
@@ -391,7 +521,7 @@ pub struct IncomingTcp<'a> {
 impl Stream for IncomingTcp<'_> {
     type Item = io::Result<Async<TcpStream>>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         self.listener
             .poll_accept(cx)
             .map(|pair| pair.map(|(st, _)| st))
@@ -428,7 +558,8 @@ impl Async<TcpStream> {
     ///
     /// Returns the number of bytes read. Successive calls of this method read the same data.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.peek(buf))).await
+        // Safety: peek() is I/O safe
+        unsafe { poll_fn(|cx| self.poll_event(Interest::Read, cx, |inner| inner.peek(buf))).await }
     }
 }
 
@@ -458,7 +589,9 @@ fn connect(tcp: &TcpStream, addr: &SocketAddr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, io::stderr, pin::pin, sync::Arc};
+    use std::{future::Future, io::stderr, pin::pin, sync::Arc, time::Duration};
+
+    use rustix::pipe::pipe;
 
     use crate::{block_on, test::MockWaker};
 
@@ -508,5 +641,63 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&connect_waker.into()))
             .is_pending());
+    }
+
+    #[test]
+    fn writable_readable() {
+        let wr_waker = Arc::new(MockWaker::default());
+        let rd_waker = Arc::new(MockWaker::default());
+
+        let (read, write) = pipe().unwrap();
+        set_nonblocking(read.as_fd()).unwrap();
+        set_nonblocking(write.as_fd()).unwrap();
+
+        let reader = Async::new(read).unwrap();
+        let writer = Async::new(write).unwrap();
+
+        let mut writable = pin!(writer.writable());
+        assert!(writable
+            .as_mut()
+            .poll(&mut Context::from_waker(&wr_waker.clone().into()))
+            .is_pending());
+        REACTOR
+            .with(|r| r.wait(&Some(Duration::from_millis(1))))
+            .unwrap();
+        assert!(wr_waker.get());
+        assert!(writable
+            .as_mut()
+            .poll(&mut Context::from_waker(&wr_waker.clone().into()))
+            .is_ready());
+
+        let mut readable = pin!(reader.readable());
+        assert!(readable
+            .as_mut()
+            .poll(&mut Context::from_waker(&wr_waker.clone().into()))
+            .is_pending());
+        REACTOR
+            .with(|r| r.wait(&Some(Duration::from_millis(1))))
+            .unwrap();
+        assert!(!rd_waker.get());
+
+        assert!(readable
+            .as_mut()
+            .poll(&mut Context::from_waker(&rd_waker.clone().into()))
+            .is_pending());
+        // Write one byte to pipe
+        unsafe {
+            assert!(writer
+                .poll_write_with(&mut Context::from_waker(&rd_waker.clone().into()), |w| {
+                    rustix::io::write(w, &[0]).map_err(Into::into)
+                })
+                .is_ready());
+        };
+        REACTOR
+            .with(|r| r.wait(&Some(Duration::from_millis(1))))
+            .unwrap();
+        assert!(rd_waker.get());
+        assert!(readable
+            .as_mut()
+            .poll(&mut Context::from_waker(&rd_waker.clone().into()))
+            .is_ready());
     }
 }
