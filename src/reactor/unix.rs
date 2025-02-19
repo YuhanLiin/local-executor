@@ -429,7 +429,7 @@ pub(crate) trait Timeout {
 ///
 /// Limited to only millisecond precision
 #[allow(unused)]
-struct PollTimeout;
+pub(crate) struct PollTimeout;
 
 impl Timeout for PollTimeout {
     fn new() -> io::Result<Self>
