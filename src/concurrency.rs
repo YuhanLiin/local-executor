@@ -346,8 +346,8 @@ impl<T, const N: usize> Stream for MergeStream<'_, T, N> {
 /// use local_runtime::merge_streams;
 ///
 /// # local_runtime::block_on(async {
-/// let a = pin!(Periodic::periodic(Duration::from_millis(14)).map(|_| 1u8));
-/// let b = pin!(Periodic::periodic(Duration::from_millis(6)).map(|_| 2u8));
+/// let a = pin!(Periodic::periodic(Duration::from_millis(70)).map(|_| 1u8));
+/// let b = pin!(Periodic::periodic(Duration::from_millis(30)).map(|_| 2u8));
 /// let stream = merge_streams!(a, b);
 /// assert_eq!(stream.take(6).collect::<Vec<_>>().await, &[2, 2, 1, 2, 2, 1]);
 /// # })
