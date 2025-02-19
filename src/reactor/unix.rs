@@ -24,7 +24,7 @@ use rustix::{
     pipe::pipe,
 };
 
-use crate::{io::set_nonblocking_and_cloexec, Id};
+use crate::{io::set_nonblocking, Id};
 
 use super::{EventHandle, Interest, Notifier, Reactor, TimeoutProvider};
 
@@ -360,8 +360,8 @@ impl NotifierFd for PipeFd {
         Self: Sized,
     {
         let (read, write) = pipe()?;
-        set_nonblocking_and_cloexec(read.as_fd())?;
-        set_nonblocking_and_cloexec(write.as_fd())?;
+        set_nonblocking(read.as_fd())?;
+        set_nonblocking(write.as_fd())?;
         Ok(Self { read, write })
     }
 

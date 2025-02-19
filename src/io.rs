@@ -155,21 +155,16 @@ impl<T: AsFd> Async<T> {
 }
 
 #[cfg(unix)]
-fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
-    let previous = rustix::fs::fcntl_getfl(fd)?;
-    let new = previous | rustix::fs::OFlags::NONBLOCK;
-    if new != previous {
-        rustix::fs::fcntl_setfl(fd, new)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-pub(crate) fn set_nonblocking_and_cloexec(fd: BorrowedFd) -> io::Result<()> {
-    let previous = rustix::fs::fcntl_getfl(fd)?;
-    let new = previous | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
-    if new != previous {
-        rustix::fs::fcntl_setfl(fd, new)?;
+pub(crate) fn set_nonblocking(fd: BorrowedFd) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    rustix::io::ioctl_fionbio(fd, true)?;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let previous = rustix::fs::fcntl_getfl(fd)?;
+        let new = previous | rustix::fs::OFlags::NONBLOCK;
+        if new != previous {
+            rustix::fs::fcntl_setfl(fd, new)?;
+        }
     }
     Ok(())
 }
@@ -572,8 +567,24 @@ fn tcp_socket(addr: &SocketAddr) -> io::Result<TcpStream> {
         SocketAddr::V6(_) => AddressFamily::INET6,
     };
     let type_ = SocketType::STREAM;
-    let socket = socket_with(af, type_, SocketFlags::empty(), None)?;
-    set_nonblocking_and_cloexec(socket.as_fd())?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let socket = socket_with(
+        af,
+        type_,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let socket = {
+        let socket = socket_with(af, type_, SocketFlags::empty(), None)?;
+        let previous = rustix::fs::fcntl_getfl(&socket)?;
+        let new = previous | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+        if new != previous {
+            rustix::fs::fcntl_setfl(&socket, new)?;
+        }
+        socket
+    };
 
     Ok(socket.into())
 }
