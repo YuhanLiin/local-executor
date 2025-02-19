@@ -11,16 +11,20 @@ use std::{
     time::Duration,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::{
-    event::{eventfd, poll, EventfdFlags, PollFd, PollFlags},
-    pipe::{pipe_with, PipeFlags},
+    event::{eventfd, EventfdFlags},
     time::{
         timerfd_create, timerfd_settime, Itimerspec, TimerfdClockId, TimerfdFlags,
         TimerfdTimerFlags, Timespec,
     },
 };
+use rustix::{
+    event::{poll, PollFd, PollFlags},
+    pipe::pipe,
+};
 
-use crate::Id;
+use crate::{io::set_nonblocking_and_cloexec, Id};
 
 use super::{EventHandle, Interest, Notifier, Reactor, TimeoutProvider};
 
@@ -336,7 +340,9 @@ impl NotifierFd for PipeFd {
     where
         Self: Sized,
     {
-        let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+        let (read, write) = pipe()?;
+        set_nonblocking_and_cloexec(read.as_fd())?;
+        set_nonblocking_and_cloexec(write.as_fd())?;
         Ok(Self { read, write })
     }
 

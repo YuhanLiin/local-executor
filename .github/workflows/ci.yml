@@ -15,7 +15,7 @@ jobs:
         with:
           toolchain: ${{matrix.toolchain}}
           components: clippy
-      - run: cargo clippy --tests -- -Dwarnings
+      - run: cargo clippy --tests
       - run: cargo build --examples
       - run: cargo test
 

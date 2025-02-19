@@ -156,6 +156,16 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn set_nonblocking_and_cloexec(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let previous = rustix::fs::fcntl_getfl(fd)?;
+    let new = previous | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+    if new != previous {
+        rustix::fs::fcntl_setfl(fd, new)?;
+    }
+    Ok(())
+}
+
 impl<T> Async<T> {
     /// Get reference to inner I/O handle
     pub fn get_ref(&self) -> &T {
@@ -402,8 +412,8 @@ fn tcp_socket(addr: &SocketAddr) -> io::Result<TcpStream> {
         SocketAddr::V6(_) => AddressFamily::INET6,
     };
     let type_ = SocketType::STREAM;
-    let flags = SocketFlags::CLOEXEC | SocketFlags::NONBLOCK;
-    let socket = socket_with(af, type_, flags, None)?;
+    let socket = socket_with(af, type_, SocketFlags::empty(), None)?;
+    set_nonblocking_and_cloexec(socket.as_fd())?;
 
     Ok(socket.into())
 }
