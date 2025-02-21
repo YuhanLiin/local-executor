@@ -16,6 +16,7 @@ use std::{
     },
     marker::PhantomData,
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
+    os::fd::AsRawFd,
     pin::Pin,
     process::{ChildStderr, ChildStdin, ChildStdout},
     task::{Context, Poll},
@@ -26,7 +27,7 @@ use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
     reactor::{EventHandle, Interest},
-    Reactor, REACTOR,
+    REACTOR,
 };
 
 /// Types whose I/O trait implementations do not move or drop the underlying I/O object
@@ -81,7 +82,7 @@ unsafe impl<T: IoSafe + ?Sized> IoSafe for &T {}
 struct GuardedHandle(EventHandle);
 impl Drop for GuardedHandle {
     fn drop(&mut self) {
-        REACTOR.with(|r| r.deregister(&self.0));
+        REACTOR.with(|r| r.deregister_event(&self.0));
     }
 }
 
@@ -135,14 +136,16 @@ impl<T: AsFd> Async<T> {
     ///
     /// The caller must ensure the I/O object has already been set to non-blocking mode. Otherwise
     /// it may block the async runtime, preventing other futures from executing on the same thread.
-    pub fn without_nonblocking(inner: T) -> Self {
+    pub fn without_nonblocking(inner: T) -> io::Result<Self> {
         // SAFETY: GuardedHandle's Drop impl will deregister the FD
-        let handle = GuardedHandle(unsafe { REACTOR.with(|r| r.register(&inner)) });
-        Self {
+        let handle = GuardedHandle(unsafe {
+            REACTOR.with(|r| r.register_event(inner.as_fd().as_raw_fd()))?
+        });
+        Ok(Self {
             inner,
             handle,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Create a new async adapter around the I/O object.
@@ -150,7 +153,7 @@ impl<T: AsFd> Async<T> {
     /// This will set the I/O object to non-blocking mode and register it onto the reactor.
     pub fn new(inner: T) -> io::Result<Self> {
         set_nonblocking(inner.as_fd())?;
-        Ok(Self::without_nonblocking(inner))
+        Self::without_nonblocking(inner)
     }
 }
 
@@ -538,7 +541,7 @@ impl Async<TcpStream> {
     /// ```
     pub async fn connect<A: Into<SocketAddr>>(addr: A) -> io::Result<Self> {
         let addr = addr.into();
-        let stream = Async::without_nonblocking(tcp_socket(&addr)?);
+        let stream = Async::without_nonblocking(tcp_socket(&addr)?)?;
 
         // Initiate the connection
         connect(&stream.inner, &addr)?;
@@ -600,7 +603,7 @@ fn connect(tcp: &TcpStream, addr: &SocketAddr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, io::stderr, pin::pin, sync::Arc, time::Duration};
+    use std::{future::Future, io::stderr, pin::pin, sync::Arc};
 
     use rustix::pipe::pipe;
 
@@ -618,7 +621,7 @@ mod tests {
 
     #[test]
     fn deregister_into_inner() {
-        let io = Async::without_nonblocking(stderr());
+        let io = Async::without_nonblocking(stderr()).unwrap();
         assert!(!REACTOR.with(|r| r.is_empty()));
         let _inner = io.into_inner();
         assert!(REACTOR.with(|r| r.is_empty()));
@@ -671,9 +674,7 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&wr_waker.clone().into()))
             .is_pending());
-        REACTOR
-            .with(|r| r.wait(&Some(Duration::from_millis(1))))
-            .unwrap();
+        REACTOR.with(|r| r.wait()).unwrap();
         assert!(wr_waker.get());
         assert!(writable
             .as_mut()
@@ -683,28 +684,17 @@ mod tests {
         let mut readable = pin!(reader.readable());
         assert!(readable
             .as_mut()
-            .poll(&mut Context::from_waker(&wr_waker.clone().into()))
-            .is_pending());
-        REACTOR
-            .with(|r| r.wait(&Some(Duration::from_millis(1))))
-            .unwrap();
-        assert!(!rd_waker.get());
-
-        assert!(readable
-            .as_mut()
             .poll(&mut Context::from_waker(&rd_waker.clone().into()))
             .is_pending());
         // Write one byte to pipe
         unsafe {
             assert!(writer
-                .poll_write_with(&mut Context::from_waker(&rd_waker.clone().into()), |w| {
+                .poll_write_with(&mut Context::from_waker(&wr_waker.clone().into()), |w| {
                     rustix::io::write(w, &[0]).map_err(Into::into)
                 })
                 .is_ready());
         };
-        REACTOR
-            .with(|r| r.wait(&Some(Duration::from_millis(1))))
-            .unwrap();
+        REACTOR.with(|r| r.wait()).unwrap();
         assert!(rd_waker.get());
         assert!(readable
             .as_mut()

@@ -9,7 +9,6 @@
 //! to the timer sleeping for longer than the requested duration, but it will never sleep for less.
 
 use std::{
-    cell::{Cell, RefCell},
     collections::BTreeMap,
     error::Error,
     fmt::Display,
@@ -24,46 +23,43 @@ use std::{
 use futures_core::Stream;
 use pin_project_lite::pin_project;
 
-use crate::{reactor::TimeoutProvider, Id};
-
-thread_local! { pub(crate) static TIMER_QUEUE: TimerQueue = const { TimerQueue::new() }; }
+use crate::{Id, REACTOR};
 
 pub(crate) struct TimerQueue {
-    current_id: Cell<Id>,
+    current_id: Id,
     // Each timer is identified by its expiry time and an incrementing ID, and ordered by the
     // expiry date. Technically it's possible for there to be conflicting identification when the
     // ID overflows and we register a duplicate expiry, but that should almost never happen.
-    timers: RefCell<BTreeMap<(Instant, Id), Waker>>,
+    timers: BTreeMap<(Instant, Id), Waker>,
 }
 
 impl TimerQueue {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            current_id: Cell::new(const { Id::new(1) }),
-            timers: RefCell::new(BTreeMap::new()),
+            current_id: const { Id::new(1) },
+            timers: BTreeMap::new(),
         }
     }
 
     /// Register a new timer with its waker, returning an ID
     ///
     /// Each timer is uniquely identified by the combination of its ID and expiry
-    fn register(&self, expiry: Instant, mut waker: Waker) -> Id {
-        let mut timer = self.timers.borrow_mut();
+    pub(crate) fn register(&mut self, expiry: Instant, mut waker: Waker) -> Id {
         loop {
-            let id = self.current_id.get();
-            self.current_id.set(id.overflowing_incr());
-            waker = match timer.insert((expiry, id), waker) {
+            let id = self.current_id;
+            self.current_id = id.overflowing_incr();
+            waker = match self.timers.insert((expiry, id), waker) {
                 None => break id,
                 // If the (expiry, id) pair already exists, restore the previous waker and try with
                 // the next ID
-                Some(prev_waker) => timer.insert((expiry, id), prev_waker).unwrap(),
+                Some(prev_waker) => self.timers.insert((expiry, id), prev_waker).unwrap(),
             }
         }
     }
 
     /// Modify the waker on an existing timer
-    fn modify(&self, id: Id, expiry: Instant, waker: &Waker) {
-        if let Some(wk) = self.timers.borrow_mut().get_mut(&(expiry, id)) {
+    pub(crate) fn modify(&mut self, id: Id, expiry: Instant, waker: &Waker) {
+        if let Some(wk) = self.timers.get_mut(&(expiry, id)) {
             wk.clone_from(waker)
         } else {
             log::error!(
@@ -75,26 +71,22 @@ impl TimerQueue {
     }
 
     /// Remove a timer from the queue before it expires
-    fn cancel(&self, id: Id, expiry: Instant) {
+    pub(crate) fn cancel(&mut self, id: Id, expiry: Instant) {
         // This timer could have expired already, in which case this becomes a noop
-        self.timers.borrow_mut().remove(&(expiry, id));
+        self.timers.remove(&(expiry, id));
     }
-}
 
-impl TimeoutProvider for TimerQueue {
-    fn next_timeout(&self) -> Option<Duration> {
-        let timers = self.timers.borrow();
+    pub(crate) fn next_timeout(&mut self) -> Option<Duration> {
         let now = Instant::now();
-        timers
+        self.timers
             .first_key_value()
             .map(|((expiry, _), _)| expiry.saturating_duration_since(now))
     }
 
-    fn update(&self) {
-        let mut timers = self.timers.borrow_mut();
+    pub(crate) fn clear_expired(&mut self) {
         let now = Instant::now();
         // Remove all expired timer entries and invoke their wakers
-        while let Some(entry) = timers.first_entry() {
+        while let Some(entry) = self.timers.first_entry() {
             let expiry = entry.key().0;
             if expiry <= now {
                 entry.remove().wake();
@@ -102,6 +94,10 @@ impl TimeoutProvider for TimerQueue {
                 break;
             }
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.timers.is_empty()
     }
 }
 
@@ -148,11 +144,11 @@ impl Timer {
     }
 
     fn register(&mut self, cx: &mut Context<'_>) {
-        TIMER_QUEUE.with(|q| match self.timer_id {
+        REACTOR.with(|r| match self.timer_id {
             None => {
-                self.timer_id = Some(q.register(self.expiry, cx.waker().clone()));
+                self.timer_id = Some(r.register_timer(self.expiry, cx.waker().clone()));
             }
-            Some(id) => q.modify(id, self.expiry, cx.waker()),
+            Some(id) => r.modify_timer(id, self.expiry, cx.waker()),
         });
     }
 }
@@ -164,7 +160,7 @@ impl Future for Timer {
         if self.expiry <= Instant::now() {
             // Deregister the timer to prevent the waker from being called
             if let Some(id) = self.timer_id.take() {
-                TIMER_QUEUE.with(|q| q.cancel(id, self.expiry));
+                REACTOR.with(|r| r.cancel_timer(id, self.expiry));
             }
             return Poll::Ready(self.expiry);
         }
@@ -177,7 +173,7 @@ impl Future for Timer {
 impl Drop for Timer {
     fn drop(&mut self) {
         if let Some(id) = self.timer_id.take() {
-            TIMER_QUEUE.with(|q| q.cancel(id, self.expiry));
+            REACTOR.with(|r| r.cancel_timer(id, self.expiry));
         }
     }
 }
@@ -335,7 +331,10 @@ pub fn timeout_at<F: Future>(fut: F, expiry: Instant) -> Timeout<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::pin, sync::Arc};
+    use std::{
+        pin::{pin, Pin},
+        sync::Arc,
+    };
 
     use crate::test::MockWaker;
 
@@ -344,7 +343,7 @@ mod tests {
     #[test]
     fn next_timeout() {
         let wakers: Vec<_> = (0..3).map(|_| Arc::new(MockWaker::default())).collect();
-        let tq = TimerQueue::new();
+        let mut tq = TimerQueue::new();
         assert!(tq.next_timeout().is_none());
 
         // First 2 timers should expire, but 3rd should not
@@ -359,7 +358,7 @@ mod tests {
         );
         assert_eq!(tq.next_timeout().unwrap(), Duration::ZERO);
 
-        tq.update();
+        tq.clear_expired();
         assert!(tq.next_timeout().unwrap() > Duration::from_millis(40));
         assert!(wakers[0].get());
         assert!(wakers[1].get());
@@ -367,51 +366,51 @@ mod tests {
 
         // After waiting, the 3rd timer should expire
         std::thread::sleep(Duration::from_millis(50));
-        tq.update();
+        tq.clear_expired();
         assert!(tq.next_timeout().is_none());
         assert!(wakers[2].get());
 
-        assert!(tq.timers.into_inner().is_empty());
+        assert!(tq.timers.is_empty());
     }
 
     #[test]
     fn modify() {
         let wakers: Vec<_> = (0..2).map(|_| Arc::new(MockWaker::default())).collect();
-        let tq = TimerQueue::new();
+        let mut tq = TimerQueue::new();
 
         let expiry = Instant::now() + Duration::from_millis(10);
         let id = tq.register(expiry, wakers[0].clone().into());
-        tq.update();
+        tq.clear_expired();
         assert!(tq.next_timeout().is_some());
 
         // Replace 1st waker with 2nd one, which should fire
         tq.modify(id, expiry, &wakers[1].clone().into());
         std::thread::sleep(Duration::from_millis(10));
-        tq.update();
+        tq.clear_expired();
         assert!(tq.next_timeout().is_none());
         assert!(!wakers[0].get());
         assert!(wakers[1].get());
 
-        assert!(tq.timers.into_inner().is_empty());
+        assert!(tq.timers.is_empty());
     }
 
     #[test]
     fn cancel() {
         let waker = Arc::new(MockWaker::default());
-        let tq = TimerQueue::new();
+        let mut tq = TimerQueue::new();
 
         let expiry = Instant::now() + Duration::from_secs(10);
         let id = tq.register(expiry, waker.clone().into());
-        tq.update();
+        tq.clear_expired();
         assert!(tq.next_timeout().is_some());
 
         // After cancelling timer, the waker shouldn't fire
         tq.cancel(id, expiry);
-        tq.update();
+        tq.clear_expired();
         assert!(tq.next_timeout().is_none());
         assert!(!waker.get());
 
-        assert!(tq.timers.into_inner().is_empty());
+        assert!(tq.timers.is_empty());
     }
 
     #[test]
@@ -424,7 +423,7 @@ mod tests {
             .is_ready());
         assert!(timer.timer_id.is_none());
 
-        assert!(TIMER_QUEUE.with(|q| q.timers.borrow().is_empty()));
+        assert!(REACTOR.with(|r| r.is_empty()));
     }
 
     #[test]
@@ -437,7 +436,7 @@ mod tests {
             .poll(&mut Context::from_waker(&waker.clone().into()))
             .is_pending());
         assert!(timer.timer_id.is_some());
-        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
+        assert!(!REACTOR.with(|r| r.is_empty()));
 
         std::thread::sleep(Duration::from_millis(10));
         assert!(timer
@@ -445,7 +444,7 @@ mod tests {
             .poll(&mut Context::from_waker(&waker.into()))
             .is_ready());
         assert!(timer.timer_id.is_none());
-        assert!(TIMER_QUEUE.with(|q| q.timers.borrow().is_empty()));
+        assert!(REACTOR.with(|r| r.is_empty()));
     }
 
     #[test]
@@ -457,21 +456,21 @@ mod tests {
             .as_mut()
             .poll_next(&mut Context::from_waker(&waker.clone().into()))
             .is_pending());
-        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 1);
+        assert!(!REACTOR.with(|r| r.is_empty()));
 
         std::thread::sleep(Duration::from_millis(5));
         assert!(periodic
             .as_mut()
             .poll_next(&mut Context::from_waker(&waker.clone().into()))
             .is_ready());
-        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 0);
+        assert!(REACTOR.with(|r| r.is_empty()));
 
         std::thread::sleep(Duration::from_millis(5));
         assert!(periodic
             .as_mut()
             .poll_next(&mut Context::from_waker(&waker.clone().into()))
             .is_ready());
-        assert_eq!(TIMER_QUEUE.with(|q| q.timers.borrow().len()), 0);
+        assert!(REACTOR.with(|r| r.is_empty()));
     }
 
     #[test]

@@ -87,8 +87,7 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use reactor::{Notifier, NotifierImpl, Reactor, REACTOR};
-use time::TIMER_QUEUE;
+use reactor::{Notifier, REACTOR};
 
 #[doc(hidden)]
 pub use concurrency::{JoinFuture, MergeFutureStream, MergeStream};
@@ -117,25 +116,25 @@ static WAKER_VTABLE: RawWakerVTable =
 
 // Use a weak pointer to the reactor's notifier as the waker, which will wake up the reactor when
 // it's waiting.
-fn create_waker(notifier: Weak<NotifierImpl>) -> Waker {
+fn create_waker(notifier: Weak<Notifier>) -> Waker {
     let raw = RawWaker::new(notifier.into_raw() as *const (), &WAKER_VTABLE);
     // SAFETY: WAKER_VTABLE follows all safety guarantees
     unsafe { Waker::from_raw(raw) }
 }
 
 unsafe fn waker_clone(ptr: *const ()) -> RawWaker {
-    let weak = Weak::from_raw(ptr as *const NotifierImpl);
+    let weak = Weak::from_raw(ptr as *const Notifier);
     let clone = Weak::clone(&weak);
     std::mem::forget(weak);
     RawWaker::new(clone.into_raw() as *const (), &WAKER_VTABLE)
 }
 
 unsafe fn waker_drop(ptr: *const ()) {
-    drop(Weak::from_raw(ptr as *const NotifierImpl));
+    drop(Weak::from_raw(ptr as *const Notifier));
 }
 
 unsafe fn wake_by_ref(ptr: *const ()) {
-    let weak = Weak::from_raw(ptr as *const NotifierImpl);
+    let weak = Weak::from_raw(ptr as *const Notifier);
     if let Some(arc) = weak.upgrade() {
         let _ = arc.notify();
     }
@@ -172,7 +171,7 @@ where
             return out;
         }
 
-        let wait_res = TIMER_QUEUE.with(|tq| REACTOR.with(|r| r.wait(tq)));
+        let wait_res = REACTOR.with(|r| r.wait());
         if let Err(err) = wait_res {
             log::error!(
                 "{:?} Error polling reactor: {err}",
