@@ -121,8 +121,8 @@ impl EventData {
     }
 }
 
-/// Wraps a `NotifierFd` implementation with an atomic flag so that the notification is only sent
-/// once to the FD.
+/// Wraps a `EventNotifier` implementation with an atomic flag so that the notification is only
+/// sent once to the FD.
 pub(crate) struct WithFlag<N> {
     inner: N,
     is_notified: AtomicBool,

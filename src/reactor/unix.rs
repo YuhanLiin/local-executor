@@ -6,12 +6,14 @@ use std::{
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix::event::{eventfd, EventfdFlags};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::time::{
     timerfd_create, timerfd_settime, Itimerspec, TimerfdClockId, TimerfdFlags, TimerfdTimerFlags,
     Timespec,
 };
 use rustix::{
-    event::{eventfd, poll, EventfdFlags, PollFd, PollFlags},
+    event::{poll, PollFd, PollFlags},
     pipe::pipe,
 };
 

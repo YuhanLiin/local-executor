@@ -4,7 +4,7 @@
 
 #[cfg(unix)]
 use std::os::{
-    fd::{AsFd, BorrowedFd},
+    fd::{AsFd, AsRawFd, BorrowedFd},
     unix::net::UnixStream,
 };
 use std::{
@@ -16,7 +16,6 @@ use std::{
     },
     marker::PhantomData,
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
-    os::fd::AsRawFd,
     pin::Pin,
     process::{ChildStderr, ChildStdin, ChildStdout},
     task::{Context, Poll},
