@@ -10,7 +10,7 @@ use std::{
 
 use futures_core::Stream;
 
-struct FlagWaker {
+pub(crate) struct FlagWaker {
     waker: Waker,
     awoken: AtomicBool,
 }
@@ -26,17 +26,18 @@ impl From<Waker> for FlagWaker {
     fn from(waker: Waker) -> Self {
         Self {
             waker,
+            // Initialize the flag to true so that the future gets polled the first time
             awoken: AtomicBool::new(true),
         }
     }
 }
 
 impl FlagWaker {
-    fn check_awoken(&self) -> bool {
+    pub(crate) fn check_awoken(&self) -> bool {
         self.awoken.swap(false, Ordering::Relaxed)
     }
 
-    fn set_awoken(&self) {
+    pub(crate) fn set_awoken(&self) {
         self.awoken.store(true, Ordering::Relaxed);
     }
 }

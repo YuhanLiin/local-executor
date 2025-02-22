@@ -10,7 +10,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::StreamExt;
 use http_body_util::BodyExt;
 use hyper::{header, Request};
-use local_runtime::{block_on, io::Async, merge_futures};
+use local_runtime::{block_on, io::Async, merge_futures, Executor};
 use pin_project_lite::pin_project;
 
 pin_project! {
@@ -69,12 +69,6 @@ impl<T: AsyncRead> hyper::rt::Read for HyperIo<T> {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum Task {
-    Connect,
-    Req,
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     //let _ = env_logger::builder()
     //.is_test(true)
@@ -89,42 +83,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .unwrap();
 
-    block_on(async {
+    let ex = Executor::new();
+    ex.run(async {
         let stream = HyperIo::new(Async::<TcpStream>::connect(addr).await?);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await?;
 
-        let conn_task = pin!(async {
+        // This task will never end, so don't await it
+        ex.spawn(async {
             if let Err(err) = conn.await {
-                println!("Connection failed: {:?}", err);
+                eprintln!("Connection failed: {:?}", err);
             }
-            Ok(Task::Connect)
         });
 
-        let req_task = pin!(async {
-            let authority = url.authority().unwrap().clone();
-            let req = Request::builder()
-                .uri(url)
-                .header(header::HOST, authority.as_str())
-                .body(String::new())?;
+        let authority = url.authority().unwrap().clone();
+        let req = Request::builder()
+            .uri(url)
+            .header(header::HOST, authority.as_str())
+            .body(String::new())?;
 
-            let mut res = sender.send_request(req).await?;
-            println!("Response status: {}", res.status());
+        let mut res = sender.send_request(req).await?;
+        println!("Response status: {}", res.status());
 
-            while let Some(next) = res.frame().await {
-                let frame = next?;
-                if let Some(chunk) = frame.data_ref() {
-                    // Use sync writes here because async writes don't really work on stdout
-                    stdout().write_all(chunk)?;
-                }
+        while let Some(next) = res.frame().await {
+            let frame = next?;
+            if let Some(chunk) = frame.data_ref() {
+                // Use sync writes here because async writes don't really work on stdout
+                stdout().write_all(chunk)?;
             }
-            Ok(Task::Req)
-        });
-
-        // Wait for the request task to complete, connect task expected to never finish
-        merge_futures!(conn_task, req_task)
-            .next()
-            .await
-            .unwrap()
-            .map(|task| assert_eq!(task, Task::Req))
+        }
+        Ok(())
     })
 }

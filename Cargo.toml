@@ -17,6 +17,7 @@ pin-project-lite = "0.2.16"
 futures-io = "0.3"
 futures-core = "0.3"
 log = "0.4"
+slab = "0.4.9"
 
 [dev-dependencies]
 futures-lite = "2.6.0"
