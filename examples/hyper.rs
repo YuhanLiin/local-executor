@@ -2,15 +2,14 @@ use std::{
     error::Error,
     io::{stdout, Write},
     net::{TcpStream, ToSocketAddrs},
-    pin::{pin, Pin},
+    pin::Pin,
     task::{Context, Poll},
 };
 
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_lite::StreamExt;
 use http_body_util::BodyExt;
 use hyper::{header, Request};
-use local_runtime::{block_on, io::Async, merge_futures, Executor};
+use local_runtime::{io::Async, Executor};
 use pin_project_lite::pin_project;
 
 pin_project! {

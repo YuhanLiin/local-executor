@@ -81,10 +81,9 @@ pub mod time;
 
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     future::Future,
     num::NonZero,
-    pin::{self, pin, Pin},
+    pin::{pin, Pin},
     rc::Rc,
     sync::{Arc, Weak},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
