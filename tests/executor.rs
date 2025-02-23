@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     future::pending,
     net::{TcpListener, TcpStream},
     rc::Rc,
@@ -8,7 +9,7 @@ use std::{
 use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use local_runtime::{
     io::Async,
-    time::{sleep, timeout},
+    time::{sleep, timeout, Periodic},
     Executor,
 };
 
@@ -89,6 +90,35 @@ fn cancelled() {
         task2.cancel();
         assert!(timeout(task2, Duration::from_millis(10)).await.is_err());
     })
+}
+
+#[test]
+fn spawn_periodic() {
+    let n = Cell::new(0);
+    let nref = &n;
+    let ex = Rc::new(Executor::new());
+    ex.run(async {
+        let _bg = ex.clone().spawn_rc(|ex| async move {
+            let mut periodic = Periodic::periodic(Duration::from_millis(10));
+            // Should run 4 times
+            loop {
+                periodic.next().await;
+                println!("BG task {}", nref.get());
+                ex.spawn(async move { nref.set(nref.get() + 1) });
+            }
+        });
+
+        let mut periodic = Periodic::periodic(Duration::from_millis(15));
+        for _ in 0..3 {
+            periodic.next().await;
+            println!("Main task {}", nref.get());
+            ex.spawn(async move { nref.set(nref.get() + 1) });
+        }
+        // Final delay to ensure that all spawned tasks are polled
+        sleep(Duration::from_micros(100)).await;
+    });
+
+    assert_eq!(n.get(), 7);
 }
 
 #[test]

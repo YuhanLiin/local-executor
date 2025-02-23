@@ -373,6 +373,12 @@ impl<'a> Executor<'a> {
                 tasks.insert(spawned_task);
             }
         }
+
+        log::trace!(
+            "{:?} {} tasks in executor",
+            std::thread::current().id(),
+            tasks.len()
+        );
     }
 
     /// Drives the future and all spawned tasks to completion on the current thread, processing I/O
