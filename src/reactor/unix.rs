@@ -199,6 +199,7 @@ impl EventNotifier for EventFd {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl AsRawFd for EventFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
