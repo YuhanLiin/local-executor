@@ -6,7 +6,11 @@ use std::{
 };
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
-use local_runtime::{io::Async, time::sleep, Executor};
+use local_runtime::{
+    io::Async,
+    time::{sleep, timeout},
+    Executor,
+};
 
 #[test]
 fn spawn_one() {
@@ -40,18 +44,23 @@ fn spawn_parallel() {
 
 #[test]
 fn spawn_recursive() {
+    let n = 10;
+    let nref = &n;
     let start = Instant::now();
     let ex = Rc::new(Executor::new());
     ex.run(async {
         #[allow(clippy::async_yields_async)]
         let task = ex.clone().spawn_rc(|ex| async move {
             sleep(Duration::from_millis(50)).await;
-            ex.spawn(sleep(Duration::from_millis(20)))
+            ex.spawn(async move {
+                sleep(Duration::from_millis(20)).await;
+                nref
+            })
         });
 
         ex.spawn(async move {
             let inner_task = task.await;
-            inner_task.await
+            assert_eq!(*inner_task.await, 10);
         })
         .await;
     });
@@ -66,6 +75,20 @@ fn spawn_dropped() {
         // Even though this task will never return, it doesn't matter because we don't await on it
         ex.spawn(pending::<()>());
     });
+}
+
+#[test]
+fn cancelled() {
+    let ex = Executor::new();
+    ex.run(async {
+        let task1 = ex.spawn(async { 3 });
+        task1.cancel();
+        assert!(timeout(task1, Duration::from_millis(10)).await.is_err());
+
+        let task2 = ex.spawn(sleep(Duration::from_millis(5)));
+        task2.cancel();
+        assert!(timeout(task2, Duration::from_millis(10)).await.is_err());
+    })
 }
 
 #[test]

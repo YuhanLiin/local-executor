@@ -80,7 +80,7 @@ mod test;
 pub mod time;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     future::Future,
     num::NonZero,
     pin::{pin, Pin},
@@ -190,6 +190,7 @@ struct Task<'a> {
     future: LocalBoxFuture<'a, ()>,
     waker_data: Arc<FlagWaker>,
     waker: Waker,
+    cancelled: Rc<Cell<bool>>,
 }
 
 impl Task<'_> {
@@ -204,14 +205,40 @@ impl Task<'_> {
     }
 }
 
+/// An async executor that can spawn tasks
+///
+/// The main reason to use this over [`block_on`] is the ability to spawn tasks.
+///
+/// # Example
+///
+/// ```
+/// use local_runtime::Executor;
+///
+/// let n = 10;
+/// let ex = Executor::new();
+/// // Run future on current thread
+/// let out = ex.run(async {
+///     // Spawn an async task that captures from the outside environment
+///     let handle = ex.spawn(async { &n });
+///     // Wait for the task to complete
+///     handle.await
+/// });
+/// assert_eq!(*out, 10);
+/// ```
 pub struct Executor<'a> {
     tasks: RefCell<Slab<Task<'a>>>,
     spawned: RefCell<Vec<Task<'a>>>,
     base_waker: Waker,
 }
 
+impl Default for Executor<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> Executor<'a> {
-    #[allow(clippy::new_without_default)]
+    /// Create new executor
     pub fn new() -> Self {
         Self {
             tasks: RefCell::new(Slab::with_capacity(8)),
@@ -220,12 +247,37 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Spawn a task on the executor, returning a [`TaskHandle`] to it
+    ///
+    /// The provided future will run concurrently on the current thread while `Executor::run` runs,
+    /// even if you don't await on the `TaskHandle`. If it's not awaited, there's no guarantee that
+    /// the task will run to completion.
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    /// use local_runtime::{io::Async, Executor};
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let ex = Executor::new();
+    /// ex.run(async {
+    ///     let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 8080))?;
+    ///     loop {
+    ///         let mut stream = listener.accept().await?;
+    ///         let task = ex.spawn(async move {
+    ///             // Process each connection concurrently
+    ///         });
+    ///     }
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
     pub fn spawn<T: 'a>(&self, fut: impl Future<Output = T> + 'a) -> TaskHandle<T> {
         let ret = Rc::new(RefCell::new(RetState {
             value: None,
             waker: None,
         }));
         let ret_clone = ret.clone();
+        let cancelled = Rc::new(Cell::new(false));
 
         let waker_data = Arc::new(FlagWaker::from(self.base_waker.clone()));
         let waker = waker_data.clone().into();
@@ -242,10 +294,60 @@ impl<'a> Executor<'a> {
             }),
             waker_data,
             waker,
+            cancelled: cancelled.clone(),
         });
-        TaskHandle { ret }
+        TaskHandle { ret, cancelled }
     }
 
+    /// Spawn a task using a [`Rc`] pointer to the executor, rather than a reference. This allows
+    /// for spawning more tasks inside spawned tasks.
+    ///
+    /// When attempting "recursive" task spawning using [`Executor::spawn`], you will encounter
+    /// borrow checker errors about the lifetime of the executor:
+    ///
+    /// ```compile_fail
+    /// use local_runtime::Executor;
+    ///
+    /// let ex = Executor::new();
+    /// //  -- binding `ex` declared here
+    /// ex.run(async {
+    ///     // ----- value captured here by coroutine
+    ///     let outer_task = ex.spawn(async {
+    ///     //               ^^ borrowed value does not live long enough
+    ///         let inner_task = ex.spawn(async { 10 });
+    ///         inner_task.await;
+    ///     });
+    /// });
+    /// // -
+    /// // |
+    /// // `ex` dropped here while still borrowed
+    /// // borrow might be used here, when `ex` is dropped and runs the destructor for type `Executor<'_>`
+    /// ```
+    ///
+    /// This happens because the future associated with the task is stored in the executor. So if
+    /// `outer_task` contains a reference to the executor, then the executor will be storing a
+    /// reference to itself, which is not allowed. To circumvent this issue, we need to put the
+    /// executor behind a [`Rc`] pointer and clone it into every task that we want to spawn more
+    /// tasks in. This is where [`spawn_rc`] comes in.
+    ///
+    /// Rather than taking a future, [`spawn_rc`] accepts a closure that takes a `Rc` to executor
+    /// and returns a future. This allows the future to capture the executor by value rather than
+    /// by reference, getting rid of the borrow error.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::rc::Rc;
+    /// use local_runtime::Executor;
+    ///
+    /// let ex = Rc::new(Executor::new());
+    /// ex.run(async {
+    ///     let outer_task = ex.clone().spawn_rc(|ex| async move {
+    ///         let inner_task = ex.spawn(async { 10 });
+    ///         inner_task.await;
+    ///     });
+    /// });
+    /// ```
     pub fn spawn_rc<T: 'a, Fut: Future<Output = T> + 'a, F>(self: Rc<Self>, f: F) -> TaskHandle<T>
     where
         F: FnOnce(Rc<Self>) -> Fut + 'a,
@@ -256,22 +358,36 @@ impl<'a> Executor<'a> {
 
     fn poll_tasks(&self) {
         let mut tasks = self.tasks.borrow_mut();
+        // Check existing tasks
         for i in 0..tasks.capacity() {
             if let Some(task) = tasks.get_mut(i) {
-                if task.poll().is_ready() {
+                // If a task is cancelled, don't poll it, just remove it
+                if task.cancelled.get() || task.poll().is_ready() {
                     tasks.remove(i);
                 }
             }
         }
+
+        // Keep checking newly spawend tasks until there's no more left
         // Reborrow the spawned tasks on every iteration, because the tasks themselves also need to
         // borrow the spawned tasks
-        while let Some(mut spawed_task) = self.spawned.borrow_mut().pop() {
-            if spawed_task.poll().is_pending() {
-                tasks.insert(spawed_task);
+        while let Some(mut spawned_task) = self.spawned.borrow_mut().pop() {
+            // Only poll and insert non-cancelled tasks
+            if !spawned_task.cancelled.get() && spawned_task.poll().is_pending() {
+                tasks.insert(spawned_task);
             }
         }
     }
 
+    /// Drives the future and all spawned tasks to completion on the current thread, processing I/O
+    /// events when idle.
+    ///
+    /// When this function completes, it will drop all unfinished tasks that were spawned on the
+    /// executor.
+    ///
+    /// # Panic
+    ///
+    /// Calling this function within a future driven by this function will panic.
     pub fn run<T>(&self, mut fut: impl Future<Output = T>) -> T {
         let mut fut = pin!(fut);
         REACTOR.with(|r| r.clear_notifications());
@@ -311,9 +427,44 @@ struct RetState<T> {
     waker: Option<Waker>,
 }
 
+/// A handle to a spawned task
+///
+/// A `TaskHandle` can be awaited to wait for the completion of its associated task and get its
+/// result.
+///
+/// A `TaskHandle` detaches its task when dropped. This means the it can no longer be awaited, but
+/// the executor will still poll its task.
+///
+/// This is created by [`Executor::spawn`] and [`Executor::spawn_rc`].
 #[derive(Debug)]
 pub struct TaskHandle<T> {
     ret: Rc<RefCell<RetState<T>>>,
+    cancelled: Rc<Cell<bool>>,
+}
+
+impl<T> TaskHandle<T> {
+    /// Cancel the task
+    ///
+    /// Deletes the task from the executor so that it won't be polled again.
+    ///
+    /// If the handle is awaited after cancellation, it might still complete if the task was
+    /// already finished before it was cancelled. However, the likelier outcomes is that it never
+    /// completes.
+    pub fn cancel(&self) {
+        self.cancelled.set(true);
+    }
+
+    /// Check if this task is finished
+    ///
+    /// If this returns `true`, the next `poll` call is guaranteed to return [`Poll::Ready`].
+    pub fn is_finished(&self) -> bool {
+        self.ret.borrow().value.is_some()
+    }
+
+    /// Check if this task has been cancelled
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
 }
 
 impl<T> Future for TaskHandle<T> {
@@ -354,5 +505,28 @@ mod tests {
         ex.spawn(async {});
         ex.poll_tasks();
         assert_eq!(ex.tasks.borrow().len(), 3);
+    }
+
+    #[test]
+    fn cancel() {
+        let ex = Executor::new();
+        assert_eq!(ex.tasks.borrow().len(), 0);
+
+        let task = ex.spawn(pending::<()>());
+        // Cancel task while it's in the spawned list
+        task.cancel();
+        assert!(task.is_cancelled());
+        ex.poll_tasks();
+        assert_eq!(ex.tasks.borrow().len(), 0);
+
+        let task = ex.spawn(pending::<()>());
+        assert!(!task.is_cancelled());
+        ex.poll_tasks();
+        assert_eq!(ex.tasks.borrow().len(), 1);
+
+        // Cancel task while it's in the task list
+        task.cancel();
+        ex.poll_tasks();
+        assert_eq!(ex.tasks.borrow().len(), 0);
     }
 }
