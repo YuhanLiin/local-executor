@@ -6,8 +6,9 @@
 //! can run futures that are `!Send` and non-`static`. If no future is able to make progress, the
 //! runtime will suspend the current thread until a future is ready to be polled.
 //!
-//! The entry point of the runtime is [`block_on`], which drives a future to completion on the
-//! current thread.
+//! To actually run a future, see [`block_on`], which drives the future to completion on the
+//! current thread. Alternatively, futures can also be run using [`Executor`], which allows tasks
+//! to be spawned and executed concurrently.
 //!
 //! In addition, This crate provides [async timers](crate::time) and an [async adapter](crate::io)
 //! for standard I/O types, similar to
@@ -22,11 +23,6 @@
 //! The implementation of the reactor depends on the platform. On Unix systems, the reactor uses
 //! [`poll`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/poll.html). Currently,
 //! Windows is not supported.
-//!
-//! # Concurrent tasks
-//!
-//! Unlike other async executors, this crate doesn't have an API for spawning tasks. Instead, use
-//! the [`join!`] or [`merge_futures`] macro to run multiple tasks concurrently.
 //!
 //! # Examples
 //!
@@ -328,9 +324,9 @@ impl<'a> Executor<'a> {
     /// `outer_task` contains a reference to the executor, then the executor will be storing a
     /// reference to itself, which is not allowed. To circumvent this issue, we need to put the
     /// executor behind a [`Rc`] pointer and clone it into every task that we want to spawn more
-    /// tasks in. This is where [`spawn_rc`] comes in.
+    /// tasks in. This is where [`Executor::spawn_rc`] comes in.
     ///
-    /// Rather than taking a future, [`spawn_rc`] accepts a closure that takes a `Rc` to executor
+    /// Rather than taking a future, `spawn_rc` accepts a closure that takes a `Rc` to executor
     /// and returns a future. This allows the future to capture the executor by value rather than
     /// by reference, getting rid of the borrow error.
     ///
