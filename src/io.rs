@@ -600,6 +600,163 @@ fn connect(tcp: &TcpStream, addr: &SocketAddr) -> io::Result<()> {
     }
 }
 
+impl Async<UdpSocket> {
+    /// Create a UDP socket from the given address
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0))?;
+    /// println!("Bound to {}", socket.get_ref().local_addr()?);
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub fn bind<A: Into<SocketAddr>>(addr: A) -> io::Result<Async<UdpSocket>> {
+        Async::new(UdpSocket::bind(addr.into())?)
+    }
+
+    /// Receives a single datagram message on a socket
+    ///
+    /// Returns the number of bytes read and the origin address.
+    ///
+    /// The function must be called with valid byte array `buf` of sufficient size to hold the
+    /// message bytes. If a message is too long to fit in the supplied buffer, excess bytes may be
+    /// discarded.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0))?;
+    ///
+    /// let mut buf = [0u8; 1024];
+    /// let (len, addr) = socket.recv_from(&mut buf).await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        poll_fn(|cx| unsafe { self.poll_read_with(cx, |inner| inner.recv_from(buf)) }).await
+    }
+
+    /// Receives a single datagram message without removing it from the queue
+    ///
+    /// Returns the number of bytes read and the origin address.
+    ///
+    /// The function must be called with valid byte array `buf` of sufficient size to hold the
+    /// message bytes. If a message is too long to fit in the supplied buffer, excess bytes may be
+    /// discarded.
+    pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        poll_fn(|cx| unsafe { self.poll_read_with(cx, |inner| inner.peek_from(buf)) }).await
+    }
+
+    /// Send data to the specified address
+    ///
+    /// Return the number of bytes written
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0))?;
+    /// let addr = socket.get_ref().local_addr()?;
+    ///
+    /// let len = socket.send_to(b"hello", addr).await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub async fn send_to<A: Into<SocketAddr>>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
+        let addr = addr.into();
+        poll_fn(|cx| unsafe { self.poll_write_with(cx, |inner| inner.send_to(buf, addr)) }).await
+    }
+
+    /// Connect this UDP socket to a remote address, allowing the [`send`](Async::send) and
+    /// [`recv`](Async::recv) methods to be called
+    ///
+    /// Also applies filters to only receive data from the specified address.
+    pub fn connect<A: Into<SocketAddr>>(&self, addr: A) -> io::Result<()> {
+        self.get_ref().connect(addr.into())
+    }
+
+    /// Receives a single datagram message from the connected peer
+    ///
+    /// Returns the number of bytes read.
+    ///
+    /// The function must be called with valid byte array `buf` of sufficient size to hold the
+    /// message bytes. If a message is too long to fit in the supplied buffer, excess bytes may be
+    /// discarded.
+    ///
+    /// This method should only be called after connecting the socket to a remote address via the
+    /// [`connect`](Async::<UdpSocket>::connect) method.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0))?;
+    /// socket.connect(([127, 0, 0, 1], 9000))?;
+    ///
+    /// let mut buf = [0u8; 1024];
+    /// let len = socket.recv(&mut buf).await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        poll_fn(|cx| unsafe { self.poll_read_with(cx, |inner| inner.recv(buf)) }).await
+    }
+
+    /// Receives a single datagram message from the connected peer without removing it from the queue
+    ///
+    /// Returns the number of bytes read.
+    ///
+    /// The function must be called with valid byte array `buf` of sufficient size to hold the
+    /// message bytes. If a message is too long to fit in the supplied buffer, excess bytes may be
+    /// discarded.
+    ///
+    /// This method should only be called after connecting the socket to a remote address via the
+    /// [`connect`](Async::<UdpSocket>::connect) method.
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        poll_fn(|cx| unsafe { self.poll_read_with(cx, |inner| inner.peek(buf)) }).await
+    }
+
+    /// Send data to the connected peer
+    ///
+    /// Return the number of bytes written.
+    ///
+    /// This method should only be called after connecting the socket to a remote address via the
+    /// [`connect`](Async::<UdpSocket>::connect) method.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    /// use local_runtime::io::Async;
+    ///
+    /// # local_runtime::block_on(async {
+    /// let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0))?;
+    /// socket.connect(([127, 0, 0, 1], 9000))?;
+    ///
+    /// let len = socket.send(b"hello").await?;
+    /// # Ok::<_, std::io::Error>(())
+    /// # });
+    /// ```
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        poll_fn(|cx| unsafe { self.poll_write_with(cx, |inner| inner.send(buf)) }).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{future::Future, io::stderr, pin::pin, sync::Arc};
