@@ -52,10 +52,10 @@ fn periodic_test() {
 #[cfg(target_os = "linux")]
 #[test]
 fn microsecond_timer() {
-    let _ = env_logger::builder()
-        .is_test(true)
-        .filter_level(log::LevelFilter::Trace)
-        .try_init();
+    //let _ = env_logger::builder()
+    //.is_test(true)
+    //.filter_level(log::LevelFilter::Trace)
+    //.try_init();
 
     block_on(async {
         let mut periodic = Periodic::periodic(Duration::from_micros(500));

@@ -77,7 +77,7 @@ pub mod time;
 
 use std::{
     cell::{Cell, RefCell},
-    future::Future,
+    future::{poll_fn, Future},
     num::NonZero,
     pin::{pin, Pin},
     rc::Rc,
@@ -184,17 +184,19 @@ where
 
 struct Task<'a> {
     future: LocalBoxFuture<'a, ()>,
-    waker_data: Arc<FlagWaker>,
-    waker: Waker,
+    waker_data: Option<(Arc<FlagWaker>, Waker)>,
     cancelled: Rc<Cell<bool>>,
 }
 
 impl Task<'_> {
-    fn poll(&mut self) -> Poll<()> {
-        if self.waker_data.check_awoken() {
-            self.future
-                .as_mut()
-                .poll(&mut Context::from_waker(&self.waker))
+    fn poll(&mut self, base_waker: &Waker) -> Poll<()> {
+        let (waker_data, waker) = self.waker_data.get_or_insert_with(|| {
+            let waker_data = Arc::new(FlagWaker::from(base_waker.clone()));
+            let waker = waker_data.clone().into();
+            (waker_data, waker)
+        });
+        if waker_data.check_awoken() {
+            self.future.as_mut().poll(&mut Context::from_waker(waker))
         } else {
             Poll::Pending
         }
@@ -206,6 +208,8 @@ impl Task<'_> {
 /// The main reason to use this over [`block_on`] is the ability to spawn tasks.
 ///
 /// # Example
+///
+/// Run a future that spawns tasks that capture the outside environment.
 ///
 /// ```
 /// use local_runtime::Executor;
@@ -221,10 +225,30 @@ impl Task<'_> {
 /// });
 /// assert_eq!(*out, 10);
 /// ```
+///
+/// Run a "sub-executor" inside an executor, spawning tasks that capture variables from inside the
+/// future.
+///
+/// ```
+/// use local_runtime::Executor;
+///
+/// let ex = Executor::new();
+/// let out = ex.run(async {
+///     // Since this variable lives inside the future, it doesn't outlive the executor, so we
+///     // can't capture it in a task created by ex.spawn()
+///     let n = 10;
+///     let sub = Executor::new();
+///     // Instead, we spawn a task inside a "sub-executor", which limits the lifetime of the task,
+///     // allowing the variable to be captured
+///     let out = sub.run_async(async {
+///         sub.spawn(async { &n }).await
+///     }).await;
+///     assert_eq!(*out, 10);
+/// });
+/// ```
 pub struct Executor<'a> {
     tasks: RefCell<Slab<Task<'a>>>,
     spawned: RefCell<Vec<Task<'a>>>,
-    base_waker: Waker,
 }
 
 impl Default for Executor<'_> {
@@ -239,7 +263,6 @@ impl<'a> Executor<'a> {
         Self {
             tasks: RefCell::new(Slab::with_capacity(8)),
             spawned: RefCell::new(Vec::with_capacity(8)),
-            base_waker: create_waker(REACTOR.with(|r| r.notifier())),
         }
     }
 
@@ -248,6 +271,8 @@ impl<'a> Executor<'a> {
     /// The provided future will run concurrently on the current thread while `Executor::run` runs,
     /// even if you don't await on the `TaskHandle`. If it's not awaited, there's no guarantee that
     /// the task will run to completion.
+    ///
+    /// To spawn additional tasks from inside of a spawned task, see [`Executor::spawn_rc`].
     ///
     /// ```no_run
     /// use std::net::TcpListener;
@@ -275,9 +300,6 @@ impl<'a> Executor<'a> {
         let ret_clone = ret.clone();
         let cancelled = Rc::new(Cell::new(false));
 
-        let waker_data = Arc::new(FlagWaker::from(self.base_waker.clone()));
-        let waker = waker_data.clone().into();
-
         let mut spawned = self.spawned.borrow_mut();
         spawned.push(Task {
             future: Box::pin(async move {
@@ -288,8 +310,7 @@ impl<'a> Executor<'a> {
                     waker.wake_by_ref();
                 }
             }),
-            waker_data,
-            waker,
+            waker_data: None,
             cancelled: cancelled.clone(),
         });
         TaskHandle { ret, cancelled }
@@ -352,13 +373,13 @@ impl<'a> Executor<'a> {
         self.spawn(f(cl))
     }
 
-    fn poll_tasks(&self) {
+    fn poll_tasks(&self, base_waker: &Waker) {
         let mut tasks = self.tasks.borrow_mut();
         // Check existing tasks
         for i in 0..tasks.capacity() {
             if let Some(task) = tasks.get_mut(i) {
                 // If a task is cancelled, don't poll it, just remove it
-                if task.cancelled.get() || task.poll().is_ready() {
+                if task.cancelled.get() || task.poll(base_waker).is_ready() {
                     tasks.remove(i);
                 }
             }
@@ -369,7 +390,7 @@ impl<'a> Executor<'a> {
         // borrow the spawned tasks
         while let Some(mut spawned_task) = self.spawned.borrow_mut().pop() {
             // Only poll and insert non-cancelled tasks
-            if !spawned_task.cancelled.get() && spawned_task.poll().is_pending() {
+            if !spawned_task.cancelled.get() && spawned_task.poll(base_waker).is_pending() {
                 tasks.insert(spawned_task);
             }
         }
@@ -389,13 +410,13 @@ impl<'a> Executor<'a> {
     ///
     /// # Panic
     ///
-    /// Calling this function within a future driven by this function will panic.
+    /// Calling this function within a task driven by the same executor will panic.
     pub fn run<T>(&self, mut fut: impl Future<Output = T>) -> T {
         let mut fut = pin!(fut);
-        REACTOR.with(|r| r.clear_notifications());
+        let base_waker = create_waker(REACTOR.with(|r| r.notifier()));
 
         // Create waker for main future
-        let main_waker_data = Arc::new(FlagWaker::from(self.base_waker.clone()));
+        let main_waker_data = Arc::new(FlagWaker::from(base_waker.clone()));
         let main_waker = main_waker_data.clone().into();
 
         let out = loop {
@@ -404,7 +425,7 @@ impl<'a> Executor<'a> {
                     break out;
                 }
             }
-            self.poll_tasks();
+            self.poll_tasks(&base_waker);
 
             let wait_res = REACTOR.with(|r| r.wait());
             if let Err(err) = wait_res {
@@ -417,6 +438,42 @@ impl<'a> Executor<'a> {
 
         // Drop all unfinished tasks so that any Rc<Executor> inside the tasks are dropped. This
         // prevents Rc-cycles and guarantees that the executor will be dropped later
+        self.tasks.borrow_mut().clear();
+        self.spawned.borrow_mut().clear();
+        out
+    }
+
+    /// Drives the future and all spawned tasks to completion asynchronously
+    ///
+    /// When this function completes, it will drop all unfinished tasks that were spawned on the
+    /// executor.
+    ///
+    /// # Panic
+    ///
+    /// Polling the future returned by this function within a task driven by the same executor will
+    /// panic.
+    pub async fn run_async<T>(&self, fut: impl Future<Output = T>) -> T {
+        let mut fut = pin!(fut);
+        let mut main_waker_data = None;
+
+        let out = poll_fn(move |cx| {
+            // Create waker for main future
+            let (main_waker_data, main_waker) = main_waker_data.get_or_insert_with(|| {
+                let waker_data = Arc::new(FlagWaker::from(cx.waker().clone()));
+                let waker = waker_data.clone().into();
+                (waker_data, waker)
+            });
+
+            if main_waker_data.check_awoken() {
+                if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(main_waker)) {
+                    return Poll::Ready(out);
+                }
+                self.poll_tasks(cx.waker());
+            }
+            Poll::Pending
+        })
+        .await;
+
         self.tasks.borrow_mut().clear();
         self.spawned.borrow_mut().clear();
         out
@@ -490,27 +547,31 @@ impl<T> Future for TaskHandle<T> {
 mod tests {
     use std::future::pending;
 
+    use crate::test::MockWaker;
+
     use super::*;
 
     #[test]
     fn spawn_and_poll() {
+        let waker = Arc::new(MockWaker::default());
         let ex = Executor::new();
         assert_eq!(ex.tasks.borrow().len(), 0);
 
         ex.spawn(pending::<()>());
         ex.spawn(pending::<()>());
         ex.spawn(pending::<()>());
-        ex.poll_tasks();
+        ex.poll_tasks(&waker.clone().into());
         assert_eq!(ex.tasks.borrow().len(), 3);
 
         ex.spawn(async {});
         ex.spawn(async {});
-        ex.poll_tasks();
+        ex.poll_tasks(&waker.clone().into());
         assert_eq!(ex.tasks.borrow().len(), 3);
     }
 
     #[test]
     fn cancel() {
+        let waker = Arc::new(MockWaker::default());
         let ex = Executor::new();
         assert_eq!(ex.tasks.borrow().len(), 0);
 
@@ -518,17 +579,17 @@ mod tests {
         // Cancel task while it's in the spawned list
         task.cancel();
         assert!(task.is_cancelled());
-        ex.poll_tasks();
+        ex.poll_tasks(&waker.clone().into());
         assert_eq!(ex.tasks.borrow().len(), 0);
 
         let task = ex.spawn(pending::<()>());
         assert!(!task.is_cancelled());
-        ex.poll_tasks();
+        ex.poll_tasks(&waker.clone().into());
         assert_eq!(ex.tasks.borrow().len(), 1);
 
         // Cancel task while it's in the task list
         task.cancel();
-        ex.poll_tasks();
+        ex.poll_tasks(&waker.clone().into());
         assert_eq!(ex.tasks.borrow().len(), 0);
     }
 }

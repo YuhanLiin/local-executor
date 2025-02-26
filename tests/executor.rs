@@ -92,33 +92,58 @@ fn cancelled() {
     })
 }
 
+async fn periodic_test<'a>(n: &'a Cell<i32>, ex: Rc<Executor<'a>>) {
+    let _bg = ex.clone().spawn_rc(move |ex| async move {
+        let mut periodic = Periodic::periodic(Duration::from_millis(10));
+        // Should run 4 times
+        loop {
+            periodic.next().await;
+            println!("BG task {}", n.get());
+            ex.spawn(async move { n.set(n.get() + 1) });
+        }
+    });
+
+    let mut periodic = Periodic::periodic(Duration::from_millis(15));
+    for _ in 0..3 {
+        periodic.next().await;
+        println!("Main task {}", n.get());
+        ex.spawn(async move { n.set(n.get() + 1) });
+    }
+    // Final delay to ensure that all spawned tasks are polled
+    sleep(Duration::from_micros(100)).await;
+}
+
 #[test]
 fn spawn_periodic() {
     let n = Cell::new(0);
-    let nref = &n;
     let ex = Rc::new(Executor::new());
-    ex.run(async {
-        let _bg = ex.clone().spawn_rc(|ex| async move {
-            let mut periodic = Periodic::periodic(Duration::from_millis(10));
-            // Should run 4 times
-            loop {
-                periodic.next().await;
-                println!("BG task {}", nref.get());
-                ex.spawn(async move { nref.set(nref.get() + 1) });
-            }
-        });
-
-        let mut periodic = Periodic::periodic(Duration::from_millis(15));
-        for _ in 0..3 {
-            periodic.next().await;
-            println!("Main task {}", nref.get());
-            ex.spawn(async move { nref.set(nref.get() + 1) });
-        }
-        // Final delay to ensure that all spawned tasks are polled
-        sleep(Duration::from_micros(100)).await;
-    });
+    ex.run(periodic_test(&n, ex.clone()));
 
     assert_eq!(n.get(), 7);
+    assert_eq!(Rc::strong_count(&ex), 1);
+}
+
+#[test]
+fn sub_executor() {
+    let mut flag = false;
+
+    let ex = Executor::new();
+    ex.run(async {
+        ex.spawn(async {
+            sleep(Duration::from_millis(30)).await;
+            flag = true;
+        });
+
+        let n = Cell::new(0);
+        let sub = Rc::new(Executor::new());
+        sub.run_async(periodic_test(&n, sub.clone())).await;
+        assert_eq!(n.get(), 7);
+        assert_eq!(Rc::strong_count(&sub), 1);
+    });
+    drop(ex);
+
+    // run_async shouldn't block, so spawned tasks should run as well
+    assert!(flag);
 }
 
 #[test]
