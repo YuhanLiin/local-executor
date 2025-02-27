@@ -133,16 +133,14 @@ fn merge_same_time() {
     });
 }
 
-// Requires too much precision for poll-timeout based implementation
-#[cfg(target_os = "linux")]
 #[test]
 fn merge_periodic() {
     block_on(async {
-        let a = pin!(Periodic::periodic(Duration::from_millis(14)).map(|_| 1u8));
-        let b = pin!(Periodic::periodic(Duration::from_millis(6)).map(|_| 2u8));
+        let a = pin!(Periodic::periodic(Duration::from_millis(140)).map(|_| 1u8));
+        let b = pin!(Periodic::periodic(Duration::from_millis(60)).map(|_| 2u8));
         let c = pin!(stream::unfold(0, |n| async move {
             if n < 2 {
-                sleep(Duration::from_millis(5)).await;
+                sleep(Duration::from_millis(50)).await;
                 Some((3, n + 1))
             } else {
                 None
