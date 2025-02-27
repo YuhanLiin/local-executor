@@ -165,7 +165,6 @@ where
 {
     let mut fut = pin!(fut);
     let waker = create_waker(REACTOR.with(|r| r.notifier()));
-    REACTOR.with(|r| r.clear_notifications());
 
     loop {
         if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(&waker)) {
@@ -410,37 +409,9 @@ impl<'a> Executor<'a> {
     ///
     /// # Panic
     ///
-    /// Calling this function within a task driven by the same executor will panic.
-    pub fn run<T>(&self, mut fut: impl Future<Output = T>) -> T {
-        let mut fut = pin!(fut);
-        let base_waker = create_waker(REACTOR.with(|r| r.notifier()));
-
-        // Create waker for main future
-        let main_waker_data = Arc::new(FlagWaker::from(base_waker.clone()));
-        let main_waker = main_waker_data.clone().into();
-
-        let out = loop {
-            if main_waker_data.check_awoken() {
-                if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(&main_waker)) {
-                    break out;
-                }
-            }
-            self.poll_tasks(&base_waker);
-
-            let wait_res = REACTOR.with(|r| r.wait());
-            if let Err(err) = wait_res {
-                log::error!(
-                    "{:?} Error polling reactor: {err}",
-                    std::thread::current().id()
-                );
-            }
-        };
-
-        // Drop all unfinished tasks so that any Rc<Executor> inside the tasks are dropped. This
-        // prevents Rc-cycles and guarantees that the executor will be dropped later
-        self.tasks.borrow_mut().clear();
-        self.spawned.borrow_mut().clear();
-        out
+    /// Calling this function within a task spawned on the same executor will panic.
+    pub fn run<T>(&self, fut: impl Future<Output = T>) -> T {
+        block_on(self.run_async(fut))
     }
 
     /// Drives the future and all spawned tasks to completion asynchronously
@@ -450,7 +421,7 @@ impl<'a> Executor<'a> {
     ///
     /// # Panic
     ///
-    /// Polling the future returned by this function within a task driven by the same executor will
+    /// Polling the future returned by this function within a task spawned on the same executor will
     /// panic.
     pub async fn run_async<T>(&self, fut: impl Future<Output = T>) -> T {
         let mut fut = pin!(fut);
@@ -468,12 +439,14 @@ impl<'a> Executor<'a> {
                 if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(main_waker)) {
                     return Poll::Ready(out);
                 }
-                self.poll_tasks(cx.waker());
             }
+            self.poll_tasks(cx.waker());
             Poll::Pending
         })
         .await;
 
+        // Drop all unfinished tasks so that any Rc<Executor> inside the tasks are dropped. This
+        // prevents Rc-cycles and guarantees that the executor will be dropped later
         self.tasks.borrow_mut().clear();
         self.spawned.borrow_mut().clear();
         out
