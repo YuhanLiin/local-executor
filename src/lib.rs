@@ -118,8 +118,8 @@ use std::{
     num::NonZero,
     pin::{pin, Pin},
     rc::Rc,
-    sync::{Arc, Weak},
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    sync::Arc,
+    task::{Context, Poll, Wake, Waker},
 };
 
 use concurrency::FlagWaker;
@@ -149,39 +149,10 @@ impl Id {
     }
 }
 
-static WAKER_VTABLE: RawWakerVTable =
-    RawWakerVTable::new(waker_clone, wake, wake_by_ref, waker_drop);
-
-// Use a weak pointer to the reactor's notifier as the waker, which will wake up the reactor when
-// it's waiting.
-fn create_waker(notifier: Weak<Notifier>) -> Waker {
-    let raw = RawWaker::new(notifier.into_raw() as *const (), &WAKER_VTABLE);
-    // SAFETY: WAKER_VTABLE follows all safety guarantees
-    unsafe { Waker::from_raw(raw) }
-}
-
-unsafe fn waker_clone(ptr: *const ()) -> RawWaker {
-    let weak = Weak::from_raw(ptr as *const Notifier);
-    let clone = Weak::clone(&weak);
-    std::mem::forget(weak);
-    RawWaker::new(clone.into_raw() as *const (), &WAKER_VTABLE)
-}
-
-unsafe fn waker_drop(ptr: *const ()) {
-    drop(Weak::from_raw(ptr as *const Notifier));
-}
-
-unsafe fn wake_by_ref(ptr: *const ()) {
-    let weak = Weak::from_raw(ptr as *const Notifier);
-    if let Some(arc) = weak.upgrade() {
-        let _ = arc.notify();
+impl Wake for Notifier {
+    fn wake(self: Arc<Self>) {
+        let _ = self.notify();
     }
-    std::mem::forget(weak);
-}
-
-unsafe fn wake(ptr: *const ()) {
-    wake_by_ref(ptr);
-    waker_drop(ptr);
 }
 
 /// Drives a future to completion on the current thread, processing I/O events when idle.
@@ -203,7 +174,7 @@ where
     F: Future<Output = T>,
 {
     let mut fut = pin!(fut);
-    let waker = create_waker(REACTOR.with(|r| r.notifier()));
+    let waker = REACTOR.with(|r| r.notifier()).into();
 
     loop {
         if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(&waker)) {

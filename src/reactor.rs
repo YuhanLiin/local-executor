@@ -6,7 +6,7 @@ use std::{
     io,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Weak,
+        Arc,
     },
     task::Waker,
     time::{Duration, Instant},
@@ -326,8 +326,8 @@ impl Reactor {
     }
 
     /// Return a handle to a notifier object that can be used to wake up the reactor.
-    pub(crate) fn notifier(&self) -> Weak<Notifier> {
-        Arc::downgrade(&self.notifier)
+    pub(crate) fn notifier(&self) -> Arc<Notifier> {
+        self.notifier.clone()
     }
 
     pub(crate) fn register_timer(&self, expiry: Instant, waker: Waker) -> Id {
