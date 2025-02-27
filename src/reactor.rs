@@ -14,11 +14,6 @@ use std::{
 
 use crate::{time::TimerQueue, Id};
 
-#[cfg(unix)]
-type Poller = unix::Poller;
-#[cfg(unix)]
-pub(crate) type Notifier = WithFlag<unix::PollerNotifier>;
-
 /// Type of event that we're interested in receiving
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Interest {
@@ -168,23 +163,25 @@ impl<N: EventNotifier> WithFlag<N> {
     }
 }
 
-struct State {
+struct State<P> {
     id: Id,
-    poller: Poller,
+    poller: P,
     event_sources: BTreeMap<EventHandle, EventData>,
     timer_queue: TimerQueue,
 }
 
-pub(crate) struct Reactor {
-    state: RefCell<State>,
-    notifier: Arc<Notifier>,
+#[allow(private_bounds)]
+pub(crate) struct Reactor<P: EventPoller> {
+    state: RefCell<State<P>>,
+    notifier: Arc<WithFlag<P::Notifier>>,
 }
 
 /// General trait for the reactor used to wakeup futures
-impl Reactor {
+#[allow(private_bounds)]
+impl<P: EventPoller> Reactor<P> {
     /// Construct new reactor
     pub(crate) fn new() -> io::Result<Self> {
-        let (poller, notifier) = Poller::new()?;
+        let (poller, notifier) = P::new()?;
         Ok(Reactor {
             state: RefCell::new(State {
                 id: const { Id::new(1) },
@@ -325,11 +322,6 @@ impl Reactor {
         Ok(())
     }
 
-    /// Return a handle to a notifier object that can be used to wake up the reactor.
-    pub(crate) fn notifier(&self) -> Arc<Notifier> {
-        self.notifier.clone()
-    }
-
     pub(crate) fn register_timer(&self, expiry: Instant, waker: Waker) -> Id {
         self.state.borrow_mut().timer_queue.register(expiry, waker)
     }
@@ -361,6 +353,19 @@ impl Reactor {
     }
 }
 
+#[cfg(unix)]
+type Poller = unix::Poller;
+#[cfg(unix)]
+pub(crate) type Notifier = WithFlag<unix::PollerNotifier>;
+
 thread_local! {
-    pub(crate) static REACTOR: Reactor = Reactor::new().expect("Failed to initialize reactor");
+    pub(crate) static REACTOR: Reactor<Poller> = Reactor::new().expect("Failed to initialize reactor");
+}
+
+// Can't put this in the generic impl block, otherwise we get privacy issues with the notifier type
+impl Reactor<Poller> {
+    /// Return a handle to a notifier object that can be used to wake up the reactor.
+    pub(crate) fn notifier(&self) -> Arc<Notifier> {
+        self.notifier.clone()
+    }
 }
