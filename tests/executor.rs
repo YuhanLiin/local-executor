@@ -124,7 +124,7 @@ fn spawn_periodic() {
 }
 
 #[test]
-fn sub_executor() {
+fn sub_executor_periodic() {
     let mut flag = false;
 
     let ex = Executor::new();
@@ -144,6 +144,25 @@ fn sub_executor() {
 
     // run_async shouldn't block, so spawned tasks should run as well
     assert!(flag);
+}
+
+#[test]
+fn sub_executor_one() {
+    let ex = Executor::new();
+    ex.run(async {
+        let n = 10;
+        let sub = Executor::new();
+        let out = sub
+            .run_async(async {
+                let handle = sub.spawn(async {
+                    sleep(Duration::from_millis(30)).await;
+                    &n
+                });
+                handle.await
+            })
+            .await;
+        assert_eq!(*out, n);
+    });
 }
 
 #[test]
