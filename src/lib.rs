@@ -26,14 +26,11 @@
 //!
 //! # Examples
 //!
-//! Concurrently listen for connections on a local port while making connections to localhost with
-//! a 500 microsecond delay. Return with error if any operation fails.
+//! Listen for connections on a local port, while concurrently making connections to localhost.
+//! Return with error if any operation fails.
 //!
 //! ```no_run
-//! use std::net::{TcpStream, TcpListener};
-//! use std::time::Duration;
-//! use std::io;
-//! use std::pin::pin;
+//! use std::{net::{TcpStream, TcpListener}, time::Duration, io, pin::pin};
 //! use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
 //! use local_runtime::{io::Async, time::sleep, block_on, merge_futures};
 //!
@@ -42,7 +39,8 @@
 //! let addr = listener.get_ref().local_addr()?;
 //!
 //! block_on(async {
-//!     let task1 = pin!(async {
+//!     let fut1 = pin!(async {
+//!         // Listen for connections on local port
 //!         loop {
 //!             let (mut stream, _) = listener.accept().await?;
 //!             let mut buf = [0u8; 5];
@@ -52,7 +50,8 @@
 //!         Ok::<_, io::Error>(())
 //!     });
 //!
-//!     let task2 = pin!(async {
+//!     let fut2 = pin!(async {
+//!         // Connect to the listener repeatedly with 50us delay
 //!         loop {
 //!             let mut stream = Async::<TcpStream>::connect(addr).await?;
 //!             stream.write_all(b"hello").await?;
@@ -61,8 +60,46 @@
 //!         Ok::<_, io::Error>(())
 //!     });
 //!
-//!     // Process the result of each task as a stream, returning early on error
-//!     merge_futures!(task1, task2).try_for_each(|x| x).await
+//!     // Run the two futures concurrently.
+//!     // Process the result of each future as a stream, returning early on error.
+//!     merge_futures!(fut1, fut2).try_for_each(|x| x).await
+//! })?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Same example, but with task spawning and [`Executor`] instead of [`block_on`].
+//!
+//! ```no_run
+//! use std::{net::{TcpStream, TcpListener}, time::Duration, io};
+//! use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
+//! use local_runtime::{io::Async, time::sleep, Executor, merge_futures};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let ex = Executor::new();
+//! ex.run(async {
+//!     let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+//!     let addr = listener.get_ref().local_addr()?;
+//!
+//!     // Run this task in the background
+//!     let _bg = ex.spawn(async move {
+//!         // Listen for connections on local port
+//!         loop {
+//!             let (mut stream, _) = listener.accept().await?;
+//!             let mut buf = [0u8; 5];
+//!             stream.read_exact(&mut buf).await?;
+//!             assert_eq!(&buf, b"hello");
+//!         }
+//!         Ok::<_, io::Error>(())
+//!     });
+//!
+//!     // Connect to the listener repeatedly with 50us delay
+//!     loop {
+//!         let mut stream = Async::<TcpStream>::connect(addr).await?;
+//!         stream.write_all(b"hello").await?;
+//!         sleep(Duration::from_micros(500)).await;
+//!     }
+//!     Ok::<_, io::Error>(())
 //! })?;
 //! # Ok(())
 //! # }
@@ -148,6 +185,8 @@ unsafe fn wake(ptr: *const ()) {
 }
 
 /// Drives a future to completion on the current thread, processing I/O events when idle.
+///
+/// Does not support task spawning (see [`Executor::run`]).
 ///
 /// # Example
 ///
@@ -418,6 +457,8 @@ impl<'a> Executor<'a> {
     ///
     /// When this function completes, it will drop all unfinished tasks that were spawned on the
     /// executor.
+    ///
+    /// This function doesn't rely on the reactor at all, making it a good fit with other runtimes.
     ///
     /// # Panic
     ///
