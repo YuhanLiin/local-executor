@@ -135,6 +135,11 @@ impl<T: AsFd> Async<T> {
     ///
     /// The caller must ensure the I/O object has already been set to non-blocking mode. Otherwise
     /// it may block the async runtime, preventing other futures from executing on the same thread.
+    ///
+    /// # Error
+    ///
+    /// If there is currently another `Async` constructed on the same I/O object on the current
+    /// thread, this function will return an error.
     pub fn without_nonblocking(inner: T) -> io::Result<Self> {
         // SAFETY: GuardedHandle's Drop impl will deregister the FD
         let source = inner.as_fd().as_raw_fd();
@@ -149,6 +154,11 @@ impl<T: AsFd> Async<T> {
     /// Create a new async adapter around the I/O object.
     ///
     /// This will set the I/O object to non-blocking mode and register it onto the reactor.
+    ///
+    /// # Error
+    ///
+    /// If there is currently another `Async` constructed on the same I/O object on the current
+    /// thread, this function will return an error.
     pub fn new(inner: T) -> io::Result<Self> {
         set_nonblocking(inner.as_fd())?;
         Self::without_nonblocking(inner)
