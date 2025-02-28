@@ -25,7 +25,7 @@ use futures_core::Stream;
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
-    reactor::{EventHandle, Interest},
+    reactor::{Interest, Source},
     REACTOR,
 };
 
@@ -77,11 +77,11 @@ unsafe impl<T: IoSafe + ?Sized> IoSafe for Box<T> {}
 /// can still drop or move internal fields via interior mutability.
 unsafe impl<T: IoSafe + ?Sized> IoSafe for &T {}
 
-// Deregisters the event handle on drop to ensure I/O safety
-struct GuardedHandle(EventHandle);
-impl Drop for GuardedHandle {
+// Deregisters the event source on drop to ensure I/O safety
+struct GuardedSource(Source);
+impl Drop for GuardedSource {
     fn drop(&mut self) {
-        REACTOR.with(|r| r.deregister_event(&self.0));
+        REACTOR.with(|r| r.deregister_event(self.0));
     }
 }
 
@@ -119,7 +119,7 @@ impl Drop for GuardedHandle {
 /// ```
 pub struct Async<T> {
     // Make sure the handle is dropped before the inner I/O type
-    handle: GuardedHandle,
+    source: GuardedSource,
     inner: T,
     // Make this both !Send and !Sync
     _phantom: PhantomData<*const ()>,
@@ -137,12 +137,11 @@ impl<T: AsFd> Async<T> {
     /// it may block the async runtime, preventing other futures from executing on the same thread.
     pub fn without_nonblocking(inner: T) -> io::Result<Self> {
         // SAFETY: GuardedHandle's Drop impl will deregister the FD
-        let handle = GuardedHandle(unsafe {
-            REACTOR.with(|r| r.register_event(inner.as_fd().as_raw_fd()))?
-        });
+        let source = inner.as_fd().as_raw_fd();
+        unsafe { REACTOR.with(|r| r.register_event(source))? }
         Ok(Self {
             inner,
-            handle,
+            source: GuardedSource(source),
             _phantom: PhantomData,
         })
     }
@@ -196,7 +195,7 @@ impl<T> Async<T> {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {}
             Err(err) => return Poll::Ready(Err(err)),
         }
-        REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
+        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
         Poll::Pending
     }
 
@@ -214,7 +213,7 @@ impl<T> Async<T> {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {}
             Err(err) => return Poll::Ready(Err(err)),
         }
-        REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
+        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
         Poll::Pending
     }
 
@@ -333,15 +332,15 @@ impl<T> Async<T> {
             if first_call {
                 first_call = false;
                 // First enable the event
-                REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
+                REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
                 Poll::Pending
             } else {
                 // Then, check if the event is ready
-                match REACTOR.with(|r| r.is_event_ready(&self.handle.0, interest)) {
+                match REACTOR.with(|r| r.is_event_ready(self.source.0, interest)) {
                     true => Poll::Ready(()),
                     // If not, then update the event waker
                     false => {
-                        REACTOR.with(|r| r.enable_event(&self.handle.0, interest, cx.waker()));
+                        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
                         Poll::Pending
                     }
                 }

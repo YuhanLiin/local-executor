@@ -17,7 +17,7 @@ use rustix::{
     pipe::pipe,
 };
 
-use crate::{io::set_nonblocking, Id};
+use crate::io::set_nonblocking;
 
 use super::{EventNotifier, EventPoller, Filter, Source, WithFlag};
 
@@ -45,7 +45,6 @@ impl Filter {
 pub(crate) struct PollPoller<N, T> {
     // All the pollfds will be constructed from raw fds, so don't worry about lifetimes
     pollfds: Vec<PollFd<'static>>,
-    ids: Vec<Id>,
     notifier: Arc<WithFlag<N>>,
     timeout: T,
 }
@@ -62,7 +61,6 @@ impl<N: NotifierFd, T: Timeout> EventPoller for PollPoller<N, T> {
         Ok((
             Self {
                 pollfds: vec![],
-                ids: vec![],
                 notifier,
                 timeout: T::new()?,
             },
@@ -85,22 +83,22 @@ impl<N: NotifierFd, T: Timeout> EventPoller for PollPoller<N, T> {
     fn poll(
         &mut self,
         timeout: Option<Duration>,
-        event_sources: impl Iterator<Item = ((Source, Id), Filter)>,
-    ) -> io::Result<Option<impl Iterator<Item = ((Source, Id), Filter)> + '_>> {
+        event_sources: impl Iterator<Item = (Source, Filter)>,
+    ) -> io::Result<Option<impl Iterator<Item = (Source, Filter)> + '_>> {
         self.pollfds.clear();
-        self.ids.clear();
         // Set timeout as early as possible so that the timerfd starts ticking earlier
         let poll_timeout = self.timeout.set_timeout(timeout)?;
 
-        for ((source, id), filter) in event_sources {
+        for (source, filter) in event_sources {
             let pollflags = filter.pollflags();
             if !pollflags.is_empty() {
                 // SAFETY: pollfds will be cleared by the end of the call
                 let fd = unsafe { BorrowedFd::borrow_raw(source) };
                 self.pollfds.push(PollFd::from_borrowed_fd(fd, pollflags));
-                self.ids.push(id);
             }
         }
+        let event_len = self.pollfds.len();
+
         // SAFETY: pollfds will be cleared by the end of the call
         unsafe {
             self.pollfds.push(PollFd::from_borrowed_fd(
@@ -118,7 +116,7 @@ impl<N: NotifierFd, T: Timeout> EventPoller for PollPoller<N, T> {
         log::trace!(
             "{:?} Reactor polling {} event sources with timeout of {} microseconds",
             std::thread::current().id(),
-            self.ids.len(),
+            event_len,
             if let Some(t) = timeout {
                 t.as_micros() as i128
             } else {
@@ -133,7 +131,7 @@ impl<N: NotifierFd, T: Timeout> EventPoller for PollPoller<N, T> {
             0 => None,
             // If the only events received are the ones without a waker, then skip the waker check
             n @ 1 | n @ 2
-                if self.pollfds[self.ids.len()..]
+                if self.pollfds[event_len..]
                     .iter()
                     .filter(|pfd| !pfd.revents().is_empty())
                     .count()
@@ -145,15 +143,14 @@ impl<N: NotifierFd, T: Timeout> EventPoller for PollPoller<N, T> {
             _ => Some(
                 self.pollfds
                     .iter()
-                    .zip(self.ids.iter())
-                    .filter(|(pollfd, _)| !pollfd.revents().is_empty())
-                    .map(|(pollfd, id)| {
+                    .filter(|pollfd| !pollfd.revents().is_empty())
+                    .map(|pollfd| {
                         let source = pollfd.as_fd().as_raw_fd();
                         let filter = Filter {
                             read: pollfd.revents().intersects(read_flags()),
                             write: pollfd.revents().intersects(write_flags()),
                         };
-                        ((source, *id), filter)
+                        (source, filter)
                     }),
             ),
         };
@@ -437,9 +434,9 @@ mod tests {
         let timerfd = TimerFd::new().unwrap();
         let pipe = PipeFd::new().unwrap();
         let events = [
-            ((efd.fd.as_raw_fd(), Id::new(1)), Filter::read()),
-            ((timerfd.fd.as_raw_fd(), Id::new(2)), Filter::read()),
-            ((pipe.read.as_raw_fd(), Id::new(3)), Filter::read()),
+            (efd.fd.as_raw_fd(), Filter::read()),
+            (timerfd.fd.as_raw_fd(), Filter::read()),
+            (pipe.read.as_raw_fd(), Filter::read()),
         ];
 
         efd.notify().unwrap();

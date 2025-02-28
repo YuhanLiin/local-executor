@@ -21,15 +21,8 @@ pub(crate) enum Interest {
     Write,
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg(unix)]
-pub(crate) struct EventHandle {
-    source: Source,
-    id: Id,
-}
-
-#[cfg(unix)]
-type Source = std::os::fd::RawFd;
+pub(crate) type Source = std::os::fd::RawFd;
 #[cfg(not(unix))]
 compile_error!("Unsupported operating system!");
 
@@ -73,8 +66,8 @@ trait EventPoller {
     fn poll(
         &mut self,
         timeout: Option<Duration>,
-        event_sources: impl Iterator<Item = ((Source, Id), Filter)>,
-    ) -> io::Result<Option<impl Iterator<Item = ((Source, Id), Filter)> + '_>>;
+        event_sources: impl Iterator<Item = (Source, Filter)>,
+    ) -> io::Result<Option<impl Iterator<Item = (Source, Filter)> + '_>>;
 }
 
 #[derive(Default)]
@@ -164,9 +157,8 @@ impl<N: EventNotifier> WithFlag<N> {
 }
 
 struct State<P> {
-    id: Id,
     poller: P,
-    event_sources: BTreeMap<EventHandle, EventData>,
+    event_sources: BTreeMap<Source, EventData>,
     timer_queue: TimerQueue,
 }
 
@@ -184,7 +176,6 @@ impl<P: EventPoller> Reactor<P> {
         let (poller, notifier) = P::new()?;
         Ok(Reactor {
             state: RefCell::new(State {
-                id: const { Id::new(1) },
                 poller,
                 event_sources: BTreeMap::new(),
                 timer_queue: TimerQueue::new(),
@@ -199,75 +190,64 @@ impl<P: EventPoller> Reactor<P> {
     ///
     /// SAFETY: The event source must not be dropped before it's cleared from the reactor via
     /// `deregister()`.
-    pub(crate) unsafe fn register_event(&self, source: Source) -> io::Result<EventHandle> {
+    pub(crate) unsafe fn register_event(&self, source: Source) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        let fd = source;
         state.poller.register(source)?;
-        loop {
-            let id = state.id;
-            state.id = state.id.overflowing_incr();
-            let handle = EventHandle { source: fd, id };
-            // On the rare chance that the (ID, raw_fd) pair already exists, which can only happen
-            // if the ID overflowed and the same FD is still registered on that ID, then just try
-            // the next ID.
-            match state
-                .event_sources
-                .insert(EventHandle { ..handle }, EventData::default())
-            {
-                None => break Ok(handle),
-                // Restore the previous event source
-                Some(prev_data) => {
-                    state.event_sources.insert(handle, prev_data);
-                }
-            }
+        if let Some(prev) = state.event_sources.insert(source, EventData::default()) {
+            // Restore previous entry
+            state.event_sources.insert(source, prev);
+            return Err(io::Error::other(
+                "event source already registered in reactor",
+            ));
         }
+        Ok(())
     }
 
     /// Deregister event source from the reactor
-    pub(crate) fn deregister_event(&self, handle: &EventHandle) {
+    pub(crate) fn deregister_event(&self, source: Source) {
         let mut state = self.state.borrow_mut();
-        if state.event_sources.remove(handle).is_none() {
+        if state.event_sources.remove(&source).is_none() {
             log::error!(
-                "{:?} Deregistering non-existent event source {handle:?}",
+                "{:?} Deregistering non-existent event source {source:?}",
                 std::thread::current().id(),
             );
         }
-        if let Err(err) = state.poller.deregister(handle.source) {
+        if let Err(err) = state.poller.deregister(source) {
             log::error!(
-                "{:?} Error deregistering {handle:?}: {err}",
+                "{:?} Error deregistering {source:?}: {err}",
                 std::thread::current().id(),
             );
         }
     }
 
     /// Enable a registered event source.
-    pub(crate) fn enable_event(&self, handle: &EventHandle, interest: Interest, waker: &Waker) {
+    pub(crate) fn enable_event(&self, source: Source, interest: Interest, waker: &Waker) {
         let mut state = self.state.borrow_mut();
-        if let Some(event_data) = state.event_sources.get_mut(handle) {
+        if let Some(event_data) = state.event_sources.get_mut(&source) {
             let dir = match interest {
                 Interest::Read => &mut event_data.read,
                 Interest::Write => &mut event_data.write,
             };
             dir.enable(waker);
             let filter = event_data.filter();
-            if let Err(err) = state.poller.modify(handle.source, filter) {
+            if let Err(err) = state.poller.modify(source, filter) {
                 log::error!(
-                    "{:?} Error enabling event source {handle:?}: {err}",
+                    "{:?} Error enabling event source {source:?}: {err}",
                     std::thread::current().id()
                 );
             }
         } else {
             log::error!(
-                "{:?} Enabling non-existent event source {handle:?}",
+                "{:?} Enabling non-existent event source {source:?}",
                 std::thread::current().id()
             );
         }
     }
 
     /// Check if an event is ready since the last time `enable_event` was called
-    pub(crate) fn is_event_ready(&self, handle: &EventHandle, interest: Interest) -> bool {
+    pub(crate) fn is_event_ready(&self, source: Source, interest: Interest) -> bool {
         let state = self.state.borrow();
-        if let Some(entry) = state.event_sources.get(handle) {
+        if let Some(entry) = state.event_sources.get(&source) {
             let dir = match interest {
                 Interest::Read => &entry.read,
                 Interest::Write => &entry.write,
@@ -275,7 +255,7 @@ impl<P: EventPoller> Reactor<P> {
             !dir.enabled
         } else {
             log::error!(
-                "{:?} Checking non-existent event source {handle:?}",
+                "{:?} Checking non-existent event source {source:?}",
                 std::thread::current().id(),
             );
             false
@@ -293,19 +273,15 @@ impl<P: EventPoller> Reactor<P> {
                 std::thread::current().id(),
             );
         } else {
-            let event_sources = state
-                .event_sources
-                .iter()
-                .map(|(h, d)| ((h.source, h.id), d.filter()));
+            let event_sources = state.event_sources.iter().map(|(s, d)| (*s, d.filter()));
             let revents = state.poller.poll(timeout, event_sources)?;
             // Now that we have awaken from the poll call, there's no need to send any
             // notifications to "wake up" from the poll, so we set the notified flag to prevent
             // our wakers from sending any notifications.
             self.notifier.set_to_notified();
 
-            for ((source, id), filter) in revents.into_iter().flatten() {
-                let handle = EventHandle { source, id };
-                let data = state.event_sources.get_mut(&handle).unwrap();
+            for (source, filter) in revents.into_iter().flatten() {
+                let data = state.event_sources.get_mut(&source).unwrap();
                 if filter.read {
                     data.read.wake();
                 }
