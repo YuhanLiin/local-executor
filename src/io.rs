@@ -81,7 +81,9 @@ unsafe impl<T: IoSafe + ?Sized> IoSafe for &T {}
 struct GuardedSource(Source);
 impl Drop for GuardedSource {
     fn drop(&mut self) {
-        REACTOR.with(|r| r.deregister_event(self.0));
+        if let Err(err) = REACTOR.with(|r| r.deregister_event(self.0)) {
+            log::error!("Drop failed due to deregistration failure: {err}");
+        }
     }
 }
 
@@ -205,7 +207,7 @@ impl<T> Async<T> {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {}
             Err(err) => return Poll::Ready(Err(err)),
         }
-        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
+        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()))?;
         Poll::Pending
     }
 
@@ -223,7 +225,7 @@ impl<T> Async<T> {
             Err(err) if err.kind() == ErrorKind::WouldBlock => {}
             Err(err) => return Poll::Ready(Err(err)),
         }
-        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
+        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()))?;
         Poll::Pending
     }
 
@@ -336,21 +338,21 @@ impl<T> Async<T> {
         self.poll_event_mut(Interest::Write, cx, f)
     }
 
-    async fn wait_for_event_ready(&self, interest: Interest) {
+    async fn wait_for_event_ready(&self, interest: Interest) -> io::Result<()> {
         let mut first_call = true;
         poll_fn(|cx| {
             if first_call {
                 first_call = false;
                 // First enable the event
-                REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
+                REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()))?;
                 Poll::Pending
             } else {
                 // Then, check if the event is ready
                 match REACTOR.with(|r| r.is_event_ready(self.source.0, interest)) {
-                    true => Poll::Ready(()),
+                    true => Poll::Ready(Ok(())),
                     // If not, then update the event waker
                     false => {
-                        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()));
+                        REACTOR.with(|r| r.enable_event(self.source.0, interest, cx.waker()))?;
                         Poll::Pending
                     }
                 }
@@ -360,12 +362,12 @@ impl<T> Async<T> {
     }
 
     /// Waits until the I/O object is available to write without blocking
-    pub async fn writable(&self) {
+    pub async fn writable(&self) -> io::Result<()> {
         self.wait_for_event_ready(Interest::Write).await
     }
 
     /// Waits until the I/O object is available to read without blocking
-    pub async fn readable(&self) {
+    pub async fn readable(&self) -> io::Result<()> {
         self.wait_for_event_ready(Interest::Read).await
     }
 }
@@ -554,7 +556,7 @@ impl Async<TcpStream> {
         // Initiate the connection
         connect(&stream.inner, &addr)?;
         // Wait for the stream to be writable
-        stream.wait_for_event_ready(Interest::Write).await;
+        stream.wait_for_event_ready(Interest::Write).await?;
         // Check for errors
         stream.inner.peer_addr()?;
         Ok(stream)

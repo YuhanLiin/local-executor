@@ -221,62 +221,49 @@ impl<P: EventPoller> Reactor<P> {
     }
 
     /// Deregister event source from the reactor
-    pub(crate) fn deregister_event(&self, source: Source) {
+    pub(crate) fn deregister_event(&self, source: Source) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        if state.event_sources.remove(&source).is_none() {
-            log::error!(
-                "{:?} Deregistering non-existent event source {source:?}",
-                std::thread::current().id(),
-            );
-        }
-        if let Err(err) = state.poller.deregister(source) {
-            log::error!(
-                "{:?} Error deregistering {source:?}: {err}",
-                std::thread::current().id(),
-            );
-        }
+        state.poller.deregister(source)?;
+        state
+            .event_sources
+            .remove(&source)
+            .expect("deregistering non-existent event source");
+        Ok(())
     }
 
     /// Enable a registered event source.
-    pub(crate) fn enable_event(&self, source: Source, interest: Interest, waker: &Waker) {
+    pub(crate) fn enable_event(
+        &self,
+        source: Source,
+        interest: Interest,
+        waker: &Waker,
+    ) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        if let Some(event_data) = state.event_sources.get_mut(&source) {
-            let dir = match interest {
-                Interest::Read => &mut event_data.read,
-                Interest::Write => &mut event_data.write,
-            };
-            dir.enable(waker);
-            let filter = event_data.filter();
-            if let Err(err) = state.poller.modify(source, filter) {
-                log::error!(
-                    "{:?} Error enabling event source {source:?}: {err}",
-                    std::thread::current().id()
-                );
-            }
-        } else {
-            log::error!(
-                "{:?} Enabling non-existent event source {source:?}",
-                std::thread::current().id()
-            );
-        }
+        let event_data = state
+            .event_sources
+            .get_mut(&source)
+            .expect("enabling non-existent event source");
+        let dir = match interest {
+            Interest::Read => &mut event_data.read,
+            Interest::Write => &mut event_data.write,
+        };
+        dir.enable(waker);
+        let filter = event_data.filter();
+        state.poller.modify(source, filter)
     }
 
     /// Check if an event is ready since the last time `enable_event` was called
     pub(crate) fn is_event_ready(&self, source: Source, interest: Interest) -> bool {
         let state = self.state.borrow();
-        if let Some(entry) = state.event_sources.get(&source) {
-            let dir = match interest {
-                Interest::Read => &entry.read,
-                Interest::Write => &entry.write,
-            };
-            !dir.enabled
-        } else {
-            log::error!(
-                "{:?} Checking non-existent event source {source:?}",
-                std::thread::current().id(),
-            );
-            false
-        }
+        let entry = state
+            .event_sources
+            .get(&source)
+            .expect("checking non-existent event source");
+        let dir = match interest {
+            Interest::Read => &entry.read,
+            Interest::Write => &entry.write,
+        };
+        !dir.enabled
     }
 
     /// Wait for an event on the reactor with an optional timeout, then clears all event sources.
@@ -489,9 +476,15 @@ mod tests {
         assert_eq!(borrow!(reactor->event_sources.len()), 2);
 
         // Enable event
-        reactor.enable_event(100, Interest::Read, &waker1.clone().into());
-        reactor.enable_event(101, Interest::Read, &waker2.clone().into());
-        reactor.enable_event(101, Interest::Write, &waker3.clone().into());
+        reactor
+            .enable_event(100, Interest::Read, &waker1.clone().into())
+            .unwrap();
+        reactor
+            .enable_event(101, Interest::Read, &waker2.clone().into())
+            .unwrap();
+        reactor
+            .enable_event(101, Interest::Write, &waker3.clone().into())
+            .unwrap();
         assert_eq!(
             borrow!(reactor->poller.registrations.iter().collect::<Vec<_>>()),
             vec![(&100, &Filter::read()), (&101, &Filter::both())]
@@ -536,7 +529,7 @@ mod tests {
         );
 
         // Deregister
-        reactor.deregister_event(101);
+        reactor.deregister_event(101).unwrap();
         assert!(borrow!(reactor->poller.registrations.get(&100).is_some()));
         assert_eq!(borrow!(reactor->poller.registrations.len()), 1);
         assert!(borrow!(reactor->event_sources.get(&100).is_some()));
@@ -559,8 +552,12 @@ mod tests {
 
         unsafe { reactor.register_event(100).unwrap() };
         unsafe { reactor.register_event(101).unwrap() };
-        reactor.enable_event(100, Interest::Read, &waker.clone().into());
-        reactor.enable_event(101, Interest::Read, &waker.clone().into());
+        reactor
+            .enable_event(100, Interest::Read, &waker.clone().into())
+            .unwrap();
+        reactor
+            .enable_event(101, Interest::Read, &waker.clone().into())
+            .unwrap();
 
         // Poll returns nothing, so no event should have fired
         reactor.wait().unwrap();
@@ -577,7 +574,9 @@ mod tests {
 
         for (src, waker) in &events {
             unsafe { reactor.register_event(*src as Source).unwrap() };
-            reactor.enable_event(*src as Source, Interest::Read, &waker.clone().into());
+            reactor
+                .enable_event(*src as Source, Interest::Read, &waker.clone().into())
+                .unwrap();
         }
 
         for i in [0, 1, 4] {
@@ -596,20 +595,26 @@ mod tests {
         unsafe { reactor.register_event(100).unwrap() };
         borrow!(reactor->poller.poll_output = vec![(100, Filter::read())]);
 
-        reactor.enable_event(100, Interest::Read, &wakers[0].clone().into());
+        reactor
+            .enable_event(100, Interest::Read, &wakers[0].clone().into())
+            .unwrap();
         reactor.wait().unwrap();
         assert!(wakers[0].get());
 
-        reactor.enable_event(100, Interest::Read, &wakers[1].clone().into());
+        reactor
+            .enable_event(100, Interest::Read, &wakers[1].clone().into())
+            .unwrap();
         reactor.wait().unwrap();
         assert!(wakers[1].get());
 
-        reactor.enable_event(100, Interest::Read, &wakers[2].clone().into());
+        reactor
+            .enable_event(100, Interest::Read, &wakers[2].clone().into())
+            .unwrap();
         reactor.wait().unwrap();
         assert!(wakers[2].get());
 
         // Make sure event is deleted properly after multiple enables
-        reactor.deregister_event(100);
+        reactor.deregister_event(100).unwrap();
         assert!(borrow!(reactor->poller.registrations.is_empty()));
         assert!(borrow!(reactor->event_sources.is_empty()));
     }
@@ -620,8 +625,12 @@ mod tests {
         let waker = Arc::new(MockWaker::default());
 
         unsafe { reactor.register_event(100).unwrap() };
-        reactor.enable_event(100, Interest::Read, &waker.clone().into());
-        reactor.enable_event(100, Interest::Write, &waker.clone().into());
+        reactor
+            .enable_event(100, Interest::Read, &waker.clone().into())
+            .unwrap();
+        reactor
+            .enable_event(100, Interest::Write, &waker.clone().into())
+            .unwrap();
 
         // Both events are polled, but only the read event fires
         borrow!(reactor->poller.poll_output = vec![(100, Filter::read())]);
@@ -639,7 +648,7 @@ mod tests {
         );
 
         // Make sure event is deleted properly after multiple enables
-        reactor.deregister_event(100);
+        reactor.deregister_event(100).unwrap();
         assert!(borrow!(reactor->poller.registrations.is_empty()));
         assert!(borrow!(reactor->event_sources.is_empty()));
     }
