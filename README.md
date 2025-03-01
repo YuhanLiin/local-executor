@@ -14,4 +14,6 @@ In addition, This crate provides async timers and an async adapter for standard
 I/O types, similar to
 [`async-io`](https://docs.rs/async-io/latest/async_io/index.html).
 
+Note: Currently, Windows is **not** supported.
+
 See the [docs](https://docs.rs/local-runtime/latest) for more info.
