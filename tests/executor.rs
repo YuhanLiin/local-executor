@@ -17,7 +17,7 @@ use local_runtime::{
 fn spawn_one() {
     let n = 10;
     let ex = Executor::new();
-    let out = ex.run(async {
+    let out = ex.block_on(async {
         let handle = ex.spawn(async { &n });
         handle.await
     });
@@ -28,7 +28,7 @@ fn spawn_one() {
 fn spawn_parallel() {
     let start = Instant::now();
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         let task1 = ex.spawn(sleep(Duration::from_millis(100)));
         let task2 = ex.spawn(async {
             sleep(Duration::from_millis(50)).await;
@@ -49,7 +49,7 @@ fn spawn_recursive() {
     let nref = &n;
     let start = Instant::now();
     let ex = Rc::new(Executor::new());
-    ex.run(async {
+    ex.block_on(async {
         #[allow(clippy::async_yields_async)]
         let task = ex.clone().spawn_rc(|ex| async move {
             sleep(Duration::from_millis(50)).await;
@@ -72,7 +72,7 @@ fn spawn_recursive() {
 #[test]
 fn spawn_dropped() {
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         // Even though this task will never return, it doesn't matter because we don't await on it
         ex.spawn(pending::<()>());
     });
@@ -81,7 +81,7 @@ fn spawn_dropped() {
 #[test]
 fn cancelled() {
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         let task1 = ex.spawn(async { 3 });
         task1.cancel();
         assert!(timeout(task1, Duration::from_millis(10)).await.is_err());
@@ -117,7 +117,7 @@ async fn periodic_test<'a>(n: &'a Cell<i32>, ex: Rc<Executor<'a>>) {
 fn spawn_periodic() {
     let n = Cell::new(0);
     let ex = Rc::new(Executor::new());
-    ex.run(periodic_test(&n, ex.clone()));
+    ex.block_on(periodic_test(&n, ex.clone()));
 
     assert_eq!(n.get(), 7);
     assert_eq!(Rc::strong_count(&ex), 1);
@@ -128,7 +128,7 @@ fn sub_executor_periodic() {
     let mut flag = false;
 
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         ex.spawn(async {
             sleep(Duration::from_millis(30)).await;
             flag = true;
@@ -136,7 +136,7 @@ fn sub_executor_periodic() {
 
         let n = Cell::new(0);
         let sub = Rc::new(Executor::new());
-        sub.run_async(periodic_test(&n, sub.clone())).await;
+        sub.run(periodic_test(&n, sub.clone())).await;
         assert_eq!(n.get(), 7);
         assert_eq!(Rc::strong_count(&sub), 1);
     });
@@ -149,11 +149,11 @@ fn sub_executor_periodic() {
 #[test]
 fn sub_executor_one() {
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         let n = 10;
         let sub = Executor::new();
         let out = sub
-            .run_async(async {
+            .run(async {
                 let handle = sub.spawn(async {
                     sleep(Duration::from_millis(30)).await;
                     &n
@@ -177,7 +177,7 @@ fn client_server() {
 
     let client = std::thread::spawn(move || {
         let ex = Executor::new();
-        ex.run(async {
+        ex.block_on(async {
             for i in 1..=10 {
                 let mut buf = [0u8; 11];
                 let mut stream = Async::<TcpStream>::connect(addr).await.unwrap();
@@ -189,7 +189,7 @@ fn client_server() {
     });
 
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         let mut incoming = listener.incoming();
         let mut tasks = vec![];
         for i in 1..=10 {

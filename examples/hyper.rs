@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let ex = Executor::new();
-    ex.run(async {
+    ex.block_on(async {
         let stream = HyperIo::new(Async::<TcpStream>::connect(addr).await?);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await?;
 

@@ -6,11 +6,10 @@
 //! can run futures that are `!Send` and non-`static`. If no future is able to make progress, the
 //! runtime will suspend the current thread until a future is ready to be polled.
 //!
-//! To actually run a future, see [`block_on`], which drives the future to completion on the
-//! current thread. Alternatively, futures can also be run using [`Executor`], which allows tasks
-//! to be spawned and executed concurrently.
+//! To actually run a future, see [`block_on`] or [`Executor::block_on`], which drives the future
+//! to completion on the current thread.
 //!
-//! In addition, This crate provides [async timers](crate::time) and an [async adapter](crate::io)
+//! In addition, This crate provides [async timers](crate::time) and an [async adapter](Async)
 //! for standard I/O types, similar to
 //! [`async-io`](https://docs.rs/async-io/latest/async_io/index.html).
 //!
@@ -24,60 +23,31 @@
 //! [`poll`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/poll.html). Currently,
 //! Windows is not supported.
 //!
+//! # Concurrency
+//!
+//! The [`Executor`] can spawn tasks that run concurrently on the same thread. Alternatively, this
+//! crate provides macros such as [`join`] and [`merge_futures`] for concurrent execution.
+//!
+//! # Compatibility
+//!
+//! Unlike other runtimes, `local_runtime` doesn't run the reactor in the background, instead
+//! relying on [`block_on`] to run the reactor while polling the future. Since leaf futures from
+//! this crate, such as [`Async`] and timers, rely on the reactor to wake up, **they can only be
+//! driven by [`block_on`], and are not compatible with other runtimes**.
+//!
 //! # Examples
 //!
 //! Listen for connections on a local port, while concurrently making connections to localhost.
 //! Return with error if any operation fails.
 //!
 //! ```no_run
-//! use std::{net::{TcpStream, TcpListener}, time::Duration, io, pin::pin};
-//! use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
-//! use local_runtime::{io::Async, time::sleep, block_on, merge_futures};
-//!
-//! # fn main() -> std::io::Result<()> {
-//! let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
-//! let addr = listener.get_ref().local_addr()?;
-//!
-//! block_on(async {
-//!     let fut1 = pin!(async {
-//!         // Listen for connections on local port
-//!         loop {
-//!             let (mut stream, _) = listener.accept().await?;
-//!             let mut buf = [0u8; 5];
-//!             stream.read_exact(&mut buf).await?;
-//!             assert_eq!(&buf, b"hello");
-//!         }
-//!         Ok::<_, io::Error>(())
-//!     });
-//!
-//!     let fut2 = pin!(async {
-//!         // Connect to the listener repeatedly with 50us delay
-//!         loop {
-//!             let mut stream = Async::<TcpStream>::connect(addr).await?;
-//!             stream.write_all(b"hello").await?;
-//!             sleep(Duration::from_micros(500)).await;
-//!         }
-//!         Ok::<_, io::Error>(())
-//!     });
-//!
-//!     // Run the two futures concurrently.
-//!     // Process the result of each future as a stream, returning early on error.
-//!     merge_futures!(fut1, fut2).try_for_each(|x| x).await
-//! })?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! Same example, but with task spawning and [`Executor`] instead of [`block_on`].
-//!
-//! ```no_run
 //! use std::{net::{TcpStream, TcpListener}, time::Duration, io};
 //! use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
-//! use local_runtime::{io::Async, time::sleep, Executor, merge_futures};
+//! use local_runtime::{io::Async, time::sleep, Executor};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let ex = Executor::new();
-//! ex.run(async {
+//! ex.block_on(async {
 //!     let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
 //!     let addr = listener.get_ref().local_addr()?;
 //!
@@ -128,6 +98,7 @@ use reactor::{Notifier, REACTOR};
 
 #[doc(hidden)]
 pub use concurrency::{JoinFuture, MergeFutureStream, MergeStream};
+pub use io::Async;
 use slab::Slab;
 
 // Option<Id> will be same size as `usize`
@@ -214,43 +185,22 @@ impl Task<'_> {
 
 /// An async executor that can spawn tasks
 ///
-/// The main reason to use this over [`block_on`] is the ability to spawn tasks.
-///
 /// # Example
 ///
-/// Run a future that spawns tasks that capture the outside environment.
+/// Run a future that spawns tasks and captures the outside environment.
 ///
 /// ```
-/// use local_runtime::Executor;
+/// use local_runtime::{block_on, Executor};
 ///
-/// let n = 10;
-/// let ex = Executor::new();
 /// // Run future on current thread
-/// let out = ex.run(async {
-///     // Spawn an async task that captures from the outside environment
-///     let handle = ex.spawn(async { &n });
-///     // Wait for the task to complete
-///     handle.await
-/// });
-/// assert_eq!(*out, 10);
-/// ```
-///
-/// Run a "sub-executor" inside an executor, spawning tasks that capture variables from inside the
-/// future.
-///
-/// ```
-/// use local_runtime::Executor;
-///
-/// let ex = Executor::new();
-/// let out = ex.run(async {
-///     // Since this variable lives inside the future, it doesn't outlive the executor, so we
-///     // can't capture it in a task created by ex.spawn()
+/// block_on(async {
 ///     let n = 10;
-///     let sub = Executor::new();
-///     // Instead, we spawn a task inside a "sub-executor", which limits the lifetime of the task,
-///     // allowing the variable to be captured
-///     let out = sub.run_async(async {
-///         sub.spawn(async { &n }).await
+///     let ex = Executor::new();
+///     let out = ex.run(async {
+///         // Spawn an async task that captures from the outside environment
+///         let handle = ex.spawn(async { &n });
+///         // Wait for the task to complete
+///         handle.await
 ///     }).await;
 ///     assert_eq!(*out, 10);
 /// });
@@ -277,19 +227,19 @@ impl<'a> Executor<'a> {
 
     /// Spawn a task on the executor, returning a [`TaskHandle`] to it
     ///
-    /// The provided future will run concurrently on the current thread while `Executor::run` runs,
-    /// even if you don't await on the `TaskHandle`. If it's not awaited, there's no guarantee that
-    /// the task will run to completion.
+    /// The provided future will run concurrently on the current thread while [`Executor::run`]
+    /// runs, even if you don't await on the `TaskHandle`. If it's not awaited, there's no
+    /// guarantee that the task will run to completion.
     ///
     /// To spawn additional tasks from inside of a spawned task, see [`Executor::spawn_rc`].
     ///
     /// ```no_run
     /// use std::net::TcpListener;
-    /// use local_runtime::{io::Async, Executor};
+    /// use local_runtime::{io::Async, Executor, block_on};
     ///
     /// # fn main() -> std::io::Result<()> {
     /// let ex = Executor::new();
-    /// ex.run(async {
+    /// block_on(ex.run(async {
     ///     let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 8080))?;
     ///     loop {
     ///         let mut stream = listener.accept().await?;
@@ -298,7 +248,7 @@ impl<'a> Executor<'a> {
     ///         });
     ///     }
     ///     Ok(())
-    /// })
+    /// }))
     /// # }
     /// ```
     pub fn spawn<T: 'a>(&self, fut: impl Future<Output = T> + 'a) -> TaskHandle<T> {
@@ -336,8 +286,8 @@ impl<'a> Executor<'a> {
     ///
     /// let ex = Executor::new();
     /// //  -- binding `ex` declared here
-    /// ex.run(async {
-    ///     // ----- value captured here by coroutine
+    /// ex.block_on(async {
+    ///     //      ----- value captured here by coroutine
     ///     let outer_task = ex.spawn(async {
     ///     //               ^^ borrowed value does not live long enough
     ///         let inner_task = ex.spawn(async { 10 });
@@ -367,7 +317,7 @@ impl<'a> Executor<'a> {
     /// use local_runtime::Executor;
     ///
     /// let ex = Rc::new(Executor::new());
-    /// ex.run(async {
+    /// ex.block_on(async {
     ///     let outer_task = ex.clone().spawn_rc(|ex| async move {
     ///         let inner_task = ex.spawn(async { 10 });
     ///         inner_task.await;
@@ -411,31 +361,56 @@ impl<'a> Executor<'a> {
         );
     }
 
-    /// Drives the future and all spawned tasks to completion on the current thread, processing I/O
-    /// events when idle.
+    /// Blocking version of [`Executor::run`].
     ///
-    /// When this function completes, it will drop all unfinished tasks that were spawned on the
-    /// executor.
+    /// This is just a shorthand for calling `block_on(ex.run(fut))`.
     ///
     /// # Panic
     ///
     /// Calling this function within a task spawned on the same executor will panic.
-    pub fn run<T>(&self, fut: impl Future<Output = T>) -> T {
-        block_on(self.run_async(fut))
+    pub fn block_on<T>(&self, fut: impl Future<Output = T>) -> T {
+        block_on(self.run(fut))
     }
 
-    /// Drives the future and all spawned tasks to completion asynchronously
+    /// Drives the future to completion asynchronously while also driving all spawned tasks
     ///
     /// When this function completes, it will drop all unfinished tasks that were spawned on the
     /// executor.
-    ///
-    /// This function doesn't rely on the reactor at all, making it a good fit with other runtimes.
     ///
     /// # Panic
     ///
     /// Polling the future returned by this function within a task spawned on the same executor will
     /// panic.
-    pub async fn run_async<T>(&self, fut: impl Future<Output = T>) -> T {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::net::UdpSocket;
+    /// use std::io;
+    /// use local_runtime::{block_on, Executor, Async};
+    ///
+    /// // Run future on current thread
+    /// block_on(async {
+    ///     let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0))?;
+    ///     let addr = socket.get_ref().local_addr()?;
+    ///     socket.connect(addr)?;
+    ///
+    ///     let ex = Executor::new();
+    ///     ex.run(async {
+    ///         let task = ex.spawn(async {
+    ///             socket.send(b"hello").await?;
+    ///             socket.send(b"hello").await?;
+    ///             Ok::<_, io::Error>(())
+    ///         });
+    ///
+    ///         let mut data = [0u8; 5];
+    ///         socket.recv(&mut data).await?;
+    ///         socket.recv(&mut data).await?;
+    ///         task.await
+    ///     }).await
+    /// });
+    /// ```
+    pub async fn run<T>(&self, fut: impl Future<Output = T>) -> T {
         let mut fut = pin!(fut);
         let mut main_waker_data = None;
 
