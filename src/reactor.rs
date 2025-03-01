@@ -26,18 +26,34 @@ pub(crate) type Source = std::os::fd::RawFd;
 #[cfg(not(unix))]
 compile_error!("Unsupported operating system!");
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Filter {
     read: bool,
     write: bool,
 }
 
 impl Filter {
-    #[allow(unused)]
+    #[cfg(test)]
     fn read() -> Self {
         Self {
             read: true,
             write: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn write() -> Self {
+        Self {
+            read: false,
+            write: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn both() -> Self {
+        Self {
+            read: true,
+            write: true,
         }
     }
 }
@@ -111,6 +127,7 @@ impl EventData {
 
 /// Wraps a `EventNotifier` implementation with an atomic flag so that the notification is only
 /// sent once to the FD.
+#[derive(Debug, Default)]
 pub(crate) struct WithFlag<N> {
     inner: N,
     is_notified: AtomicBool,
@@ -343,5 +360,287 @@ impl Reactor<Poller> {
     /// Return a handle to a notifier object that can be used to wake up the reactor.
     pub(crate) fn notifier(&self) -> Arc<Notifier> {
         self.notifier.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{array, sync::atomic::AtomicU32};
+
+    use crate::test::MockWaker;
+
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct MockNotifier(AtomicU32);
+
+    impl EventNotifier for MockNotifier {
+        fn clear(&self) -> io::Result<()> {
+            self.0.store(0, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn notify(&self) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockPoller {
+        notifier: Arc<WithFlag<MockNotifier>>,
+        registrations: BTreeMap<Source, Filter>,
+        poll_input: Vec<(Source, Filter)>,
+        poll_output: Vec<(Source, Filter)>,
+        ret_error: bool,
+    }
+
+    impl MockPoller {
+        fn ret(&self) -> io::Result<()> {
+            (!self.ret_error)
+                .then_some(())
+                .ok_or_else(|| io::Error::other("test error"))
+        }
+    }
+
+    impl EventPoller for MockPoller {
+        type Notifier = MockNotifier;
+
+        fn new() -> io::Result<(Self, Arc<WithFlag<Self::Notifier>>)>
+        where
+            Self: Sized,
+        {
+            let poller = MockPoller::default();
+            let notif = poller.notifier.clone();
+            Ok((poller, notif))
+        }
+
+        unsafe fn register(&mut self, source: Source) -> io::Result<()> {
+            self.registrations.insert(source, Filter::default());
+            self.ret()
+        }
+
+        fn modify(&mut self, source: Source, filter: Filter) -> io::Result<()> {
+            *self.registrations.get_mut(&source).unwrap() = filter;
+            self.ret()
+        }
+
+        fn deregister(&mut self, source: Source) -> io::Result<()> {
+            self.registrations.remove(&source);
+            self.ret()
+        }
+
+        fn poll(
+            &mut self,
+            _timeout: Option<Duration>,
+            event_sources: impl Iterator<Item = (Source, Filter)>,
+        ) -> io::Result<Option<impl Iterator<Item = (Source, Filter)> + '_>> {
+            self.poll_input = event_sources.collect();
+            let out = self.poll_output.clone().into_iter();
+            self.ret().map(|_| Some(out))
+        }
+    }
+
+    macro_rules! borrow {
+        ($reactor:ident->$($tt:tt)*) => {
+            $reactor.state.borrow_mut().$($tt)*
+        };
+    }
+
+    #[test]
+    fn flag_notifier() {
+        let notifier = WithFlag::new(MockNotifier::default());
+
+        // Send 10 notifications simultaneously
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                s.spawn(|| notifier.notify());
+            }
+        });
+
+        assert!(notifier.is_notified.load(Ordering::Relaxed));
+        // The inner notifier should have only been written once
+        assert_eq!(notifier.inner.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn io_registration() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        assert_eq!(borrow!(reactor->event_sources.len()), 0);
+        let waker1 = Arc::new(MockWaker::default());
+        let waker2 = Arc::new(MockWaker::default());
+        let waker3 = Arc::new(MockWaker::default());
+
+        // Register
+        unsafe { reactor.register_event(100).unwrap() };
+        unsafe { reactor.register_event(101).unwrap() };
+        assert_eq!(
+            borrow!(reactor->poller.registrations.iter().collect::<Vec<_>>()),
+            vec![(&100, &Filter::default()), (&101, &Filter::default())]
+        );
+        assert_eq!(
+            borrow!(reactor->event_sources[&100].filter()),
+            Filter::default()
+        );
+        assert_eq!(
+            borrow!(reactor->event_sources[&101].filter()),
+            Filter::default()
+        );
+        assert_eq!(borrow!(reactor->event_sources.len()), 2);
+
+        // Enable event
+        reactor.enable_event(100, Interest::Read, &waker1.clone().into());
+        reactor.enable_event(101, Interest::Read, &waker2.clone().into());
+        reactor.enable_event(101, Interest::Write, &waker3.clone().into());
+        assert_eq!(
+            borrow!(reactor->poller.registrations.iter().collect::<Vec<_>>()),
+            vec![(&100, &Filter::read()), (&101, &Filter::both())]
+        );
+        assert_eq!(
+            borrow!(reactor->event_sources[&100].filter()),
+            Filter::read()
+        );
+        assert_eq!(
+            borrow!(reactor->event_sources[&101].filter()),
+            Filter::both()
+        );
+        assert_eq!(borrow!(reactor->event_sources.len()), 2);
+
+        // Events not ready yet
+        assert!(!reactor.is_event_ready(100, Interest::Read));
+        assert!(!reactor.is_event_ready(101, Interest::Read));
+        assert!(!reactor.is_event_ready(101, Interest::Write));
+
+        // Wait
+        borrow!(reactor->poller.poll_output = vec![(100, Filter::read()), (101, Filter::write())]);
+        reactor.wait().unwrap();
+        assert_eq!(
+            borrow!(reactor->poller.poll_input),
+            vec![(100, Filter::read()), (101, Filter::both())]
+        );
+        // Check events ready
+        assert!(reactor.is_event_ready(100, Interest::Read));
+        assert!(!reactor.is_event_ready(101, Interest::Read));
+        assert!(reactor.is_event_ready(101, Interest::Write));
+        assert!(waker1.get());
+        assert!(!waker2.get());
+        assert!(waker3.get());
+        // Make sure fired events are no longer registered
+        assert_eq!(
+            borrow!(reactor->event_sources[&100].filter()),
+            Filter::default()
+        );
+        assert_eq!(
+            borrow!(reactor->event_sources[&101].filter()),
+            Filter::read()
+        );
+
+        // Deregister
+        reactor.deregister_event(101);
+        assert!(borrow!(reactor->poller.registrations.get(&100).is_some()));
+        assert_eq!(borrow!(reactor->poller.registrations.len()), 1);
+        assert!(borrow!(reactor->event_sources.get(&100).is_some()));
+        assert_eq!(borrow!(reactor->event_sources.len()), 1);
+    }
+
+    #[test]
+    fn empty_wait() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        reactor.wait().unwrap();
+        assert!(borrow!(reactor->poller.poll_input.is_empty()));
+        assert!(borrow!(reactor->poller.registrations.is_empty()));
+        assert!(borrow!(reactor->event_sources.is_empty()));
+    }
+
+    #[test]
+    fn poll_no_output() {
+        let waker = Arc::new(MockWaker::default());
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+
+        unsafe { reactor.register_event(100).unwrap() };
+        unsafe { reactor.register_event(101).unwrap() };
+        reactor.enable_event(100, Interest::Read, &waker.clone().into());
+        reactor.enable_event(101, Interest::Read, &waker.clone().into());
+
+        // Poll returns nothing, so no event should have fired
+        reactor.wait().unwrap();
+        assert!(!borrow!(reactor->poller.poll_input.is_empty()));
+        assert!(!reactor.is_event_ready(100, Interest::Read));
+        assert!(!reactor.is_event_ready(101, Interest::Read));
+        assert!(!waker.get());
+    }
+
+    #[test]
+    fn multiple_wakes() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let events: [_; 5] = array::from_fn(|i| (i, Arc::new(MockWaker::default())));
+
+        for (src, waker) in &events {
+            unsafe { reactor.register_event(*src as Source).unwrap() };
+            reactor.enable_event(*src as Source, Interest::Read, &waker.clone().into());
+        }
+
+        for i in [0, 1, 4] {
+            borrow!(reactor->poller.poll_output = vec![(events[i].0 as Source, Filter::read())]);
+            reactor.wait().unwrap();
+            assert!(events[i].1.get());
+        }
+        assert!(!events[2].1.get());
+        assert!(!events[3].1.get());
+    }
+
+    #[test]
+    fn modify_registration() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let wakers: [_; 3] = array::from_fn(|_| Arc::new(MockWaker::default()));
+        unsafe { reactor.register_event(100).unwrap() };
+        borrow!(reactor->poller.poll_output = vec![(100, Filter::read())]);
+
+        reactor.enable_event(100, Interest::Read, &wakers[0].clone().into());
+        reactor.wait().unwrap();
+        assert!(wakers[0].get());
+
+        reactor.enable_event(100, Interest::Read, &wakers[1].clone().into());
+        reactor.wait().unwrap();
+        assert!(wakers[1].get());
+
+        reactor.enable_event(100, Interest::Read, &wakers[2].clone().into());
+        reactor.wait().unwrap();
+        assert!(wakers[2].get());
+
+        // Make sure event is deleted properly after multiple enables
+        reactor.deregister_event(100);
+        assert!(borrow!(reactor->poller.registrations.is_empty()));
+        assert!(borrow!(reactor->event_sources.is_empty()));
+    }
+
+    #[test]
+    fn disable_event_after_poll() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let waker = Arc::new(MockWaker::default());
+
+        unsafe { reactor.register_event(100).unwrap() };
+        reactor.enable_event(100, Interest::Read, &waker.clone().into());
+        reactor.enable_event(100, Interest::Write, &waker.clone().into());
+
+        // Both events are polled, but only the read event fires
+        borrow!(reactor->poller.poll_output = vec![(100, Filter::read())]);
+        reactor.wait().unwrap();
+        assert_eq!(
+            borrow!(reactor->poller.poll_input),
+            vec![(100, Filter::both())]
+        );
+
+        // Now only the write event is polled
+        reactor.wait().unwrap();
+        assert_eq!(
+            borrow!(reactor->poller.poll_input),
+            vec![(100, Filter::write())]
+        );
+
+        // Make sure event is deleted properly after multiple enables
+        reactor.deregister_event(100);
+        assert!(borrow!(reactor->poller.registrations.is_empty()));
+        assert!(borrow!(reactor->event_sources.is_empty()));
     }
 }
