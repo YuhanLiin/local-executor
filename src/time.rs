@@ -96,6 +96,7 @@ impl TimerQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.timers.is_empty()
     }
