@@ -50,3 +50,29 @@ fn connected() {
         join!(fut1, fut2).await;
     });
 }
+
+#[test]
+fn loopback() {
+    let socket = Async::<UdpSocket>::bind(([127, 0, 0, 1], 0)).unwrap();
+    let addr = socket.get_ref().local_addr().unwrap();
+    socket.connect(addr).unwrap();
+
+    block_on(async {
+        let fut1 = async {
+            let mut data = [0u8; 5];
+            let n = socket.recv(&mut data).await.unwrap();
+            assert_eq!(&data, b"hello");
+            assert_eq!(n, 5);
+            let n = socket.recv(&mut data).await.unwrap();
+            assert_eq!(&data, b"hello");
+            assert_eq!(n, 5);
+        };
+
+        let fut2 = async {
+            socket.send(b"hello").await.unwrap();
+            socket.send(b"hello").await.unwrap();
+        };
+
+        join!(fut1, fut2).await;
+    });
+}
