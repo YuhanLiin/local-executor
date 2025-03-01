@@ -223,12 +223,11 @@ impl<P: EventPoller> Reactor<P> {
     /// Deregister event source from the reactor
     pub(crate) fn deregister_event(&self, source: Source) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        state.poller.deregister(source)?;
         state
             .event_sources
             .remove(&source)
             .expect("deregistering non-existent event source");
-        Ok(())
+        state.poller.deregister(source)
     }
 
     /// Enable a registered event source.
@@ -238,18 +237,21 @@ impl<P: EventPoller> Reactor<P> {
         interest: Interest,
         waker: &Waker,
     ) -> io::Result<()> {
-        let mut state = self.state.borrow_mut();
+        let state = &mut *self.state.borrow_mut();
         let event_data = state
             .event_sources
             .get_mut(&source)
             .expect("enabling non-existent event source");
+
         let dir = match interest {
             Interest::Read => &mut event_data.read,
             Interest::Write => &mut event_data.write,
         };
         dir.enable(waker);
+
         let filter = event_data.filter();
-        state.poller.modify(source, filter)
+        state.poller.modify(source, filter)?;
+        Ok(())
     }
 
     /// Check if an event is ready since the last time `enable_event` was called
@@ -408,7 +410,9 @@ mod tests {
         }
 
         fn modify(&mut self, source: Source, filter: Filter) -> io::Result<()> {
-            *self.registrations.get_mut(&source).unwrap() = filter;
+            if let Some(current) = self.registrations.get_mut(&source) {
+                *current = filter;
+            }
             self.ret()
         }
 
@@ -650,6 +654,81 @@ mod tests {
         // Make sure event is deleted properly after multiple enables
         reactor.deregister_event(100).unwrap();
         assert!(borrow!(reactor->poller.registrations.is_empty()));
+        assert!(borrow!(reactor->event_sources.is_empty()));
+    }
+
+    #[test]
+    fn repeat_registers() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let waker = Arc::new(MockWaker::default());
+
+        unsafe { reactor.register_event(100).unwrap() };
+        reactor
+            .enable_event(100, Interest::Read, &waker.clone().into())
+            .unwrap();
+        // If we register the same event source again, it should be an error
+        unsafe { assert!(reactor.register_event(100).is_err()) };
+
+        assert!(borrow!(reactor->poller.registrations.get(&100).is_some()));
+        // The old event source should still remain
+        assert_eq!(
+            borrow!(reactor->event_sources.get(&100)).unwrap().filter(),
+            Filter::read()
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn deregister_unfound() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let _ = reactor.deregister_event(101);
+    }
+
+    #[test]
+    #[should_panic]
+    fn enable_unfound() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let waker = Arc::new(MockWaker::default());
+        let _ = reactor.enable_event(101, Interest::Write, &waker.into());
+    }
+
+    #[test]
+    #[should_panic]
+    fn check_ready_unfound() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let _ = reactor.is_event_ready(101, Interest::Write);
+    }
+
+    #[test]
+    fn register_error() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        borrow!(reactor->poller.ret_error) = true;
+
+        unsafe { assert!(reactor.register_event(100).is_err()) };
+        assert!(borrow!(reactor->event_sources.is_empty()));
+    }
+
+    #[test]
+    fn poller_error() {
+        let reactor = Reactor::<MockPoller>::new().unwrap();
+        let waker = Arc::new(MockWaker::default());
+
+        // Make sure registering the event is successful
+        unsafe { reactor.register_event(100).unwrap() };
+        borrow!(reactor->poller.ret_error) = true;
+
+        assert!(reactor
+            .enable_event(100, Interest::Write, &waker.into())
+            .is_err());
+        // Ensure that the event source is added even if poller fails
+        assert_eq!(
+            borrow!(reactor->event_sources.get(&100)).unwrap().filter(),
+            Filter::write()
+        );
+
+        assert!(reactor.wait().is_err());
+        assert!(reactor.deregister_event(100).is_err());
+        // Even if poller fails, deregistering should still delete the event from the reactor
         assert!(borrow!(reactor->event_sources.is_empty()));
     }
 }
