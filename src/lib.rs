@@ -164,18 +164,14 @@ where
 
 struct Task<'a> {
     future: LocalBoxFuture<'a, ()>,
-    waker_data: Option<(Arc<FlagWaker>, Waker)>,
+    waker_pair: (Arc<FlagWaker>, Waker),
     cancelled: Rc<Cell<bool>>,
 }
 
 impl Task<'_> {
     fn poll(&mut self, base_waker: &Waker) -> Poll<()> {
-        let (waker_data, waker) = self.waker_data.get_or_insert_with(|| {
-            let waker_data = Arc::new(FlagWaker::from(base_waker.clone()));
-            let waker = waker_data.clone().into();
-            (waker_data, waker)
-        });
-        if waker_data.check_awoken() {
+        let (waker_data, waker) = &self.waker_pair;
+        if waker_data.check_awoken(base_waker) {
             self.future.as_mut().poll(&mut Context::from_waker(waker))
         } else {
             Poll::Pending
@@ -269,7 +265,7 @@ impl<'a> Executor<'a> {
                     waker.wake_by_ref();
                 }
             }),
-            waker_data: None,
+            waker_pair: FlagWaker::waker_pair(),
             cancelled: cancelled.clone(),
         });
         TaskHandle { ret, cancelled }
@@ -412,18 +408,12 @@ impl<'a> Executor<'a> {
     /// ```
     pub async fn run<T>(&self, fut: impl Future<Output = T>) -> T {
         let mut fut = pin!(fut);
-        let mut main_waker_data = None;
+        // Create waker for main future
+        let (main_waker_data, main_waker) = FlagWaker::waker_pair();
 
         let out = poll_fn(move |cx| {
-            // Create waker for main future
-            let (main_waker_data, main_waker) = main_waker_data.get_or_insert_with(|| {
-                let waker_data = Arc::new(FlagWaker::from(cx.waker().clone()));
-                let waker = waker_data.clone().into();
-                (waker_data, waker)
-            });
-
-            if main_waker_data.check_awoken() {
-                if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(main_waker)) {
+            if main_waker_data.check_awoken(cx.waker()) {
+                if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(&main_waker)) {
                     return Poll::Ready(out);
                 }
             }

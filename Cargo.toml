@@ -18,6 +18,7 @@ futures-io = "0.3"
 futures-core = "0.3"
 log = "0.4"
 slab = "0.4.9"
+atomic-waker = "1.1"
 
 [dev-dependencies]
 futures-lite = "2.6.0"

@@ -8,32 +8,38 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
+use atomic_waker::AtomicWaker;
 use futures_core::Stream;
 
 pub(crate) struct FlagWaker {
-    waker: Waker,
+    waker: AtomicWaker,
     awoken: AtomicBool,
 }
 
 impl Wake for FlagWaker {
     fn wake(self: Arc<Self>) {
         self.set_awoken();
-        self.waker.wake_by_ref();
-    }
-}
-
-impl From<Waker> for FlagWaker {
-    fn from(waker: Waker) -> Self {
-        Self {
-            waker,
-            // Initialize the flag to true so that the future gets polled the first time
-            awoken: AtomicBool::new(true),
-        }
+        self.waker.wake();
     }
 }
 
 impl FlagWaker {
-    pub(crate) fn check_awoken(&self) -> bool {
+    pub(crate) fn new() -> Self {
+        Self {
+            waker: AtomicWaker::new(),
+            // Initialize the flag to true so that the future gets polled the first time
+            awoken: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn waker_pair() -> (Arc<Self>, Waker) {
+        let this = Arc::new(Self::new());
+        let waker = this.clone().into();
+        (this, waker)
+    }
+
+    pub(crate) fn check_awoken(&self, waker: &Waker) -> bool {
+        self.waker.register(waker);
         self.awoken.swap(false, Ordering::Relaxed)
     }
 
@@ -63,14 +69,14 @@ impl<T> Inflight<'_, T> {
 #[must_use = "Futures do nothing unless polled"]
 pub struct JoinFuture<'a, T, const N: usize> {
     inflight: Option<[Inflight<'a, T>; N]>,
-    wakers: [Option<(Arc<FlagWaker>, Waker)>; N],
+    wakers: [(Arc<FlagWaker>, Waker); N],
 }
 
 impl<'a, T, const N: usize> JoinFuture<'a, T, N> {
     pub fn new(futures: [PinFut<'a, T>; N]) -> Self {
         Self {
             inflight: Some(futures.map(Inflight::Fut)),
-            wakers: std::array::from_fn(|_| None),
+            wakers: std::array::from_fn(|_| FlagWaker::waker_pair()),
         }
     }
 }
@@ -87,19 +93,13 @@ impl<T: Unpin, const N: usize> Future for JoinFuture<'_, T, N> {
 
 fn poll_join<T>(
     inflights: &mut [Inflight<T>],
-    wakers: &mut [Option<(Arc<FlagWaker>, Waker)>],
+    wakers: &mut [(Arc<FlagWaker>, Waker)],
     cx: &mut Context,
 ) -> Poll<()> {
     let mut out = Poll::Ready(());
-    for (inflight, waker) in inflights.iter_mut().zip(wakers.iter_mut()) {
+    for (inflight, (waker_data, waker)) in inflights.iter_mut().zip(wakers.iter_mut()) {
         if let Inflight::Fut(fut) = inflight {
-            let (waker_data, waker) = waker.get_or_insert_with(|| {
-                let waker_data = Arc::new(FlagWaker::from(cx.waker().clone()));
-                let waker = waker_data.clone().into();
-                (waker_data, waker)
-            });
-
-            if waker_data.check_awoken() {
+            if waker_data.check_awoken(cx.waker()) {
                 if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(waker)) {
                     *inflight = Inflight::Done(out);
                     continue;
@@ -146,7 +146,7 @@ macro_rules! join {
 #[must_use = "Streams do nothing unless polled"]
 pub struct MergeFutureStream<'a, T, const N: usize> {
     futures: [Option<PinFut<'a, T>>; N],
-    wakers: [Option<(Arc<FlagWaker>, Waker)>; N],
+    wakers: [(Arc<FlagWaker>, Waker); N],
     idx: usize,
     none_count: usize,
 }
@@ -155,7 +155,7 @@ impl<'a, T, const N: usize> MergeFutureStream<'a, T, N> {
     pub fn new(futures: [PinFut<'a, T>; N]) -> Self {
         Self {
             futures: futures.map(Some),
-            wakers: std::array::from_fn(|_| None),
+            wakers: std::array::from_fn(|_| FlagWaker::waker_pair()),
             idx: 0,
             none_count: 0,
         }
@@ -183,7 +183,7 @@ impl<T, const N: usize> Stream for MergeFutureStream<'_, T, N> {
 #[allow(clippy::too_many_arguments)]
 fn poll_merged<P, O, T, PF, OF, NF>(
     pollers: &mut [Option<P>],
-    wakers: &mut [Option<(Arc<FlagWaker>, Waker)>],
+    wakers: &mut [(Arc<FlagWaker>, Waker)],
     idx: &mut usize,
     none_count: &mut usize,
     cx: &mut Context,
@@ -205,15 +205,9 @@ where
     // Prioritize the futures we haven't seen yet
     let iter = iter_remain.chain(iter_past);
 
-    for (poller_opt, waker_pair) in iter {
+    for (poller_opt, (waker_data, waker)) in iter {
         if let Some(poller) = poller_opt {
-            let (waker_data, waker) = waker_pair.get_or_insert_with(|| {
-                let waker_data = Arc::new(FlagWaker::from(cx.waker().clone()));
-                let waker = waker_data.clone().into();
-                (waker_data, waker)
-            });
-
-            if waker_data.check_awoken() {
+            if waker_data.check_awoken(cx.waker()) {
                 if let Poll::Ready(out) = poll_fn(poller, &mut Context::from_waker(waker)) {
                     if none_fn(&out) {
                         *poller_opt = None;
@@ -289,7 +283,7 @@ macro_rules! merge_futures {
 #[must_use = "Streams do nothing unless polled"]
 pub struct MergeStream<'a, T, const N: usize> {
     streams: [Option<PinStream<'a, T>>; N],
-    wakers: [Option<(Arc<FlagWaker>, Waker)>; N],
+    wakers: [(Arc<FlagWaker>, Waker); N],
     idx: usize,
     none_count: usize,
 }
@@ -298,7 +292,7 @@ impl<'a, T, const N: usize> MergeStream<'a, T, N> {
     pub fn new(streams: [PinStream<'a, T>; N]) -> Self {
         Self {
             streams: streams.map(Some),
-            wakers: std::array::from_fn(|_| None),
+            wakers: std::array::from_fn(|_| FlagWaker::waker_pair()),
             idx: 0,
             none_count: 0,
         }
@@ -358,4 +352,31 @@ macro_rules! merge_streams {
     ($($fut:expr),+ $(,)?) => {
         $crate::MergeStream::new([$($fut),+])
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test::MockWaker;
+
+    use super::*;
+
+    #[test]
+    fn flag_waker_multiple_wakers() {
+        // Test that flag waker works even when the inner waker is swapped
+        let wk1 = Arc::new(MockWaker::default());
+        let wk2 = Arc::new(MockWaker::default());
+        let (flag_waker_data, flag_waker) = FlagWaker::waker_pair();
+
+        // The waker flag should be initialized as true
+        assert!(flag_waker_data.check_awoken(&wk1.clone().into()));
+        assert!(!flag_waker_data.awoken.load(Ordering::Relaxed));
+        flag_waker.wake_by_ref();
+        assert!(wk1.get());
+
+        // After calling wake_by_ref(), the flag should be set to true
+        assert!(flag_waker_data.check_awoken(&wk2.clone().into()));
+        assert!(!flag_waker_data.awoken.load(Ordering::Relaxed));
+        flag_waker.wake_by_ref();
+        assert!(wk2.get());
+    }
 }
