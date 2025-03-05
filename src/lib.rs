@@ -359,6 +359,10 @@ impl<'a> Executor<'a> {
         Self::with_capacity(4)
     }
 
+    /// Create new executor with a pre-allocated capacity
+    ///
+    /// The executor will be able to hold at least `capacity` concurrent tasks without reallocating
+    /// its internal storage.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             tasks: RefCell::new(Slab::with_capacity(capacity)),
