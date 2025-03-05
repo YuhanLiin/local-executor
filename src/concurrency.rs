@@ -11,8 +11,8 @@ use std::{
 use atomic_waker::AtomicWaker;
 use futures_core::Stream;
 
-pub(crate) struct FlagWaker {
-    waker: AtomicWaker,
+struct FlagWaker {
+    waker: Arc<AtomicWaker>,
     awoken: AtomicBool,
 }
 
@@ -24,22 +24,21 @@ impl Wake for FlagWaker {
 }
 
 impl FlagWaker {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(waker: Arc<AtomicWaker>) -> Self {
         Self {
-            waker: AtomicWaker::new(),
+            waker,
             // Initialize the flag to true so that the future gets polled the first time
             awoken: AtomicBool::new(true),
         }
     }
 
-    pub(crate) fn waker_pair() -> (Arc<Self>, Waker) {
-        let this = Arc::new(Self::new());
+    pub(crate) fn waker_pair(waker: Arc<AtomicWaker>) -> (Arc<Self>, Waker) {
+        let this = Arc::new(Self::new(waker));
         let waker = this.clone().into();
         (this, waker)
     }
 
-    pub(crate) fn check_awoken(&self, waker: &Waker) -> bool {
-        self.waker.register(waker);
+    pub(crate) fn check_awoken(&self) -> bool {
         self.awoken.swap(false, Ordering::Relaxed)
     }
 
@@ -68,15 +67,18 @@ impl<T> Inflight<'_, T> {
 #[doc(hidden)]
 #[must_use = "Futures do nothing unless polled"]
 pub struct JoinFuture<'a, T, const N: usize> {
+    base_waker: Arc<AtomicWaker>,
     inflight: Option<[Inflight<'a, T>; N]>,
     wakers: [(Arc<FlagWaker>, Waker); N],
 }
 
 impl<'a, T, const N: usize> JoinFuture<'a, T, N> {
     pub fn new(futures: [PinFut<'a, T>; N]) -> Self {
+        let base_waker = Arc::new(AtomicWaker::new());
         Self {
             inflight: Some(futures.map(Inflight::Fut)),
-            wakers: std::array::from_fn(|_| FlagWaker::waker_pair()),
+            wakers: std::array::from_fn(|_| FlagWaker::waker_pair(base_waker.clone())),
+            base_waker,
         }
     }
 }
@@ -86,20 +88,17 @@ impl<T: Unpin, const N: usize> Future for JoinFuture<'_, T, N> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        poll_join(this.inflight.as_mut().unwrap(), &mut this.wakers, cx)
+        this.base_waker.register(cx.waker());
+        poll_join(this.inflight.as_mut().unwrap(), &mut this.wakers)
             .map(|_| this.inflight.take().unwrap().map(Inflight::unwrap_done))
     }
 }
 
-fn poll_join<T>(
-    inflights: &mut [Inflight<T>],
-    wakers: &mut [(Arc<FlagWaker>, Waker)],
-    cx: &mut Context,
-) -> Poll<()> {
+fn poll_join<T>(inflights: &mut [Inflight<T>], wakers: &mut [(Arc<FlagWaker>, Waker)]) -> Poll<()> {
     let mut out = Poll::Ready(());
     for (inflight, (waker_data, waker)) in inflights.iter_mut().zip(wakers.iter_mut()) {
         if let Inflight::Fut(fut) = inflight {
-            if waker_data.check_awoken(cx.waker()) {
+            if waker_data.check_awoken() {
                 if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(waker)) {
                     *inflight = Inflight::Done(out);
                     continue;
@@ -145,6 +144,7 @@ macro_rules! join {
 #[doc(hidden)]
 #[must_use = "Streams do nothing unless polled"]
 pub struct MergeFutureStream<'a, T, const N: usize> {
+    base_waker: Arc<AtomicWaker>,
     futures: [Option<PinFut<'a, T>>; N],
     wakers: [(Arc<FlagWaker>, Waker); N],
     idx: usize,
@@ -153,11 +153,13 @@ pub struct MergeFutureStream<'a, T, const N: usize> {
 
 impl<'a, T, const N: usize> MergeFutureStream<'a, T, N> {
     pub fn new(futures: [PinFut<'a, T>; N]) -> Self {
+        let base_waker = Arc::new(AtomicWaker::new());
         Self {
             futures: futures.map(Some),
-            wakers: std::array::from_fn(|_| FlagWaker::waker_pair()),
+            wakers: std::array::from_fn(|_| FlagWaker::waker_pair(base_waker.clone())),
             idx: 0,
             none_count: 0,
+            base_waker,
         }
     }
 }
@@ -167,12 +169,12 @@ impl<T, const N: usize> Stream for MergeFutureStream<'_, T, N> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.base_waker.register(cx.waker());
         poll_merged(
             &mut this.futures,
             &mut this.wakers,
             &mut this.idx,
             &mut this.none_count,
-            cx,
             |fut, cx| fut.as_mut().poll(cx),
             |x| Some(x),
             |_| true,
@@ -186,7 +188,6 @@ fn poll_merged<P, O, T, PF, OF, NF>(
     wakers: &mut [(Arc<FlagWaker>, Waker)],
     idx: &mut usize,
     none_count: &mut usize,
-    cx: &mut Context,
     mut poll_fn: PF,
     mut opt_fn: OF,
     mut none_fn: NF,
@@ -207,7 +208,7 @@ where
 
     for (poller_opt, (waker_data, waker)) in iter {
         if let Some(poller) = poller_opt {
-            if waker_data.check_awoken(cx.waker()) {
+            if waker_data.check_awoken() {
                 if let Poll::Ready(out) = poll_fn(poller, &mut Context::from_waker(waker)) {
                     if none_fn(&out) {
                         *poller_opt = None;
@@ -282,6 +283,7 @@ macro_rules! merge_futures {
 #[doc(hidden)]
 #[must_use = "Streams do nothing unless polled"]
 pub struct MergeStream<'a, T, const N: usize> {
+    base_waker: Arc<AtomicWaker>,
     streams: [Option<PinStream<'a, T>>; N],
     wakers: [(Arc<FlagWaker>, Waker); N],
     idx: usize,
@@ -290,11 +292,13 @@ pub struct MergeStream<'a, T, const N: usize> {
 
 impl<'a, T, const N: usize> MergeStream<'a, T, N> {
     pub fn new(streams: [PinStream<'a, T>; N]) -> Self {
+        let base_waker = Arc::new(AtomicWaker::new());
         Self {
             streams: streams.map(Some),
-            wakers: std::array::from_fn(|_| FlagWaker::waker_pair()),
+            wakers: std::array::from_fn(|_| FlagWaker::waker_pair(base_waker.clone())),
             idx: 0,
             none_count: 0,
+            base_waker,
         }
     }
 }
@@ -304,12 +308,12 @@ impl<T, const N: usize> Stream for MergeStream<'_, T, N> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.base_waker.register(cx.waker());
         poll_merged(
             &mut this.streams,
             &mut this.wakers,
             &mut this.idx,
             &mut this.none_count,
-            cx,
             |fut, cx| fut.as_mut().poll_next(cx),
             |o| o,
             |o| o.is_none(),
@@ -365,17 +369,20 @@ mod tests {
         // Test that flag waker works even when the inner waker is swapped
         let wk1 = Arc::new(MockWaker::default());
         let wk2 = Arc::new(MockWaker::default());
-        let (flag_waker_data, flag_waker) = FlagWaker::waker_pair();
+        let atomic_waker = Arc::new(AtomicWaker::new());
+        let (flag_waker_data, flag_waker) = FlagWaker::waker_pair(atomic_waker.clone());
 
         // The waker flag should be initialized as true
-        assert!(flag_waker_data.check_awoken(&wk1.clone().into()));
+        assert!(flag_waker_data.check_awoken());
         assert!(!flag_waker_data.awoken.load(Ordering::Relaxed));
+        atomic_waker.register(&wk1.clone().into());
         flag_waker.wake_by_ref();
         assert!(wk1.get());
 
         // After calling wake_by_ref(), the flag should be set to true
-        assert!(flag_waker_data.check_awoken(&wk2.clone().into()));
+        assert!(flag_waker_data.check_awoken());
         assert!(!flag_waker_data.awoken.load(Ordering::Relaxed));
+        atomic_waker.register(&wk2.clone().into());
         flag_waker.wake_by_ref();
         assert!(wk2.get());
     }

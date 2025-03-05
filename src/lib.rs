@@ -828,4 +828,36 @@ mod tests {
         REACTOR.with(|r| r.wait()).unwrap();
         assert!(waker2.get());
     }
+
+    #[test]
+    fn switch_waker_join() {
+        let waker1 = Arc::new(MockWaker::default());
+        let waker2 = Arc::new(MockWaker::default());
+
+        let mut fut = pin!(join!(
+            sleep(Duration::from_millis(50)),
+            sleep(Duration::from_millis(100))
+        ));
+
+        // Poll future with waker1
+        assert!(fut
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker1.clone().into()))
+            .is_pending());
+        // Wait until the 50ms sleep is done then invoke the reactor, which should notify waker1
+        thread::sleep(Duration::from_millis(50));
+        REACTOR.with(|r| r.wait()).unwrap();
+        assert!(waker1.get());
+
+        // Poll future with waker2
+        assert!(fut
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker2.clone().into()))
+            .is_pending());
+        // Wait until the 100ms sleep is done then invoke the reactor, which should notify waker2
+        // even though the sleep task is never polled after switching to waker2
+        thread::sleep(Duration::from_millis(50));
+        REACTOR.with(|r| r.wait()).unwrap();
+        assert!(waker2.get());
+    }
 }

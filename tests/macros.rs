@@ -31,19 +31,21 @@ fn join() {
     let joined = async {
         join!(
             async {
-                let _ = timeout(CountFuture(&count), Duration::from_millis(5)).await;
+                let _ = timeout(CountFuture(&count), Duration::from_millis(50)).await;
             },
             async {
-                let _ = timeout(CountFuture(&count), Duration::from_millis(2)).await;
+                let _ = timeout(CountFuture(&count), Duration::from_millis(20)).await;
             },
             async {
-                let _ = timeout(CountFuture(&count), Duration::from_millis(10)).await;
+                let _ = timeout(CountFuture(&count), Duration::from_millis(100)).await;
             },
         )
         .await;
     };
     block_on(joined);
-    assert!(now.elapsed() >= Duration::from_millis(10));
+    let elapsed = now.elapsed();
+    assert!(elapsed >= Duration::from_millis(100));
+    assert!(elapsed < Duration::from_millis(120));
     // JoinFuture shouldn't be polling every future each time, so there should only be 6 polls
     assert_eq!(count.get(), 6);
 }
