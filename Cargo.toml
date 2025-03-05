@@ -1,6 +1,6 @@
 [package]
 name = "local-runtime"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Yuhan Lin <yuhanliin@protonmail.com>"]
 description = "Thread-local async runtime"
