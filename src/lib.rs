@@ -394,10 +394,10 @@ impl<'a> Executor<'a> {
     /// # }
     /// ```
     pub fn spawn<T: 'a>(&self, fut: impl Future<Output = T> + 'a) -> TaskHandle<T> {
-        let ret = Rc::new(RefCell::new(RetState {
-            value: None,
-            waker: None,
-        }));
+        let ret = Rc::new(RetData {
+            value: Cell::new(None),
+            waker: Cell::new(None),
+        });
         let ret_clone = ret.clone();
         let handle_data = Rc::<HandleData>::default();
 
@@ -405,10 +405,10 @@ impl<'a> Executor<'a> {
         spawned.push(SpawnedTask {
             future: Box::pin(async move {
                 let retval = fut.await;
-                let mut ret = ret_clone.borrow_mut();
-                ret.value = Some(retval);
-                if let Some(waker) = &ret.waker {
-                    waker.wake_by_ref();
+                let ret = ret_clone;
+                ret.value.set(Some(retval));
+                if let Some(waker) = ret.waker.take() {
+                    waker.wake();
                 }
             }),
             handle_data: handle_data.clone(),
@@ -605,24 +605,15 @@ impl<'a> Executor<'a> {
     }
 }
 
-#[derive(Debug)]
-struct RetState<T> {
-    value: Option<T>,
-    waker: Option<Waker>,
+struct RetData<T> {
+    value: Cell<Option<T>>,
+    waker: Cell<Option<Waker>>,
 }
 
 #[derive(Default)]
 struct HandleData {
     cancelled: Cell<bool>,
     waker: Cell<Option<Waker>>,
-}
-
-impl Debug for HandleData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HandleData")
-            .field("cancelled", &self.cancelled)
-            .finish()
-    }
 }
 
 /// A handle to a spawned task
@@ -634,9 +625,8 @@ impl Debug for HandleData {
 /// the executor will still poll its task.
 ///
 /// This is created by [`Executor::spawn`] and [`Executor::spawn_rc`].
-#[derive(Debug)]
 pub struct TaskHandle<T> {
-    ret: Rc<RefCell<RetState<T>>>,
+    ret: Rc<RetData<T>>,
     handle_data: Rc<HandleData>,
 }
 
@@ -661,7 +651,8 @@ impl<T> TaskHandle<T> {
     ///
     /// If this returns `true`, the next `poll` call is guaranteed to return [`Poll::Ready`].
     pub fn is_finished(&self) -> bool {
-        self.ret.borrow().value.is_some()
+        // SAFETY: We never get a long-lived reference to ret.value, so aliasing cannot occur
+        unsafe { (*self.ret.value.as_ptr()).is_some() }
     }
 
     /// Check if this task has been cancelled
@@ -674,15 +665,16 @@ impl<T> Future for TaskHandle<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut ret = self.ret.borrow_mut();
-        if let Some(val) = ret.value.take() {
+        if let Some(val) = self.ret.value.take() {
             return Poll::Ready(val);
         }
 
-        match &mut ret.waker {
+        let mut waker = self.ret.waker.take();
+        match &mut waker {
             Some(waker) => waker.clone_from(cx.waker()),
-            None => ret.waker = Some(cx.waker().clone()),
+            None => waker = Some(cx.waker().clone()),
         }
+        self.ret.waker.set(waker);
         Poll::Pending
     }
 }
