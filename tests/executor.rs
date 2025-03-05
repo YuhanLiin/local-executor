@@ -115,6 +115,11 @@ async fn periodic_test<'a>(n: &'a Cell<i32>, ex: Rc<Executor<'a>>) {
 
 #[test]
 fn spawn_periodic() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Trace)
+        .try_init();
+
     let n = Cell::new(0);
     let ex = Rc::new(Executor::new());
     ex.block_on(periodic_test(&n, ex.clone()));

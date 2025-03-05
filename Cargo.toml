@@ -19,6 +19,8 @@ futures-core = "0.3"
 log = "0.4"
 slab = "0.4.9"
 atomic-waker = "1.1"
+# Only needed for cross-thread task wakeups
+concurrent-queue = "2.5"
 
 [dev-dependencies]
 futures-lite = "2.6.0"
