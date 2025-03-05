@@ -17,7 +17,7 @@ jobs:
           components: clippy
       - run: cargo clippy --tests
       - run: cargo build --examples
-      - run: cargo test
+      - run: cargo test switch_waker_ex -- --nocapture
 
   documentation:
     name: Document package

@@ -791,7 +791,12 @@ mod tests {
     }
 
     #[test]
-    fn switch_waker() {
+    fn switch_waker_ex() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
+
         let ex = Executor::new();
         let waker1 = Arc::new(MockWaker::default());
         let waker2 = Arc::new(MockWaker::default());
