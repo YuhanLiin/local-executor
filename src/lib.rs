@@ -99,15 +99,14 @@ use std::{
 };
 
 use atomic_waker::AtomicWaker;
-use concurrency::FlagWaker;
 use concurrent_queue::ConcurrentQueue;
 use futures_core::future::LocalBoxFuture;
-use reactor::{Notifier, REACTOR};
+use slab::Slab;
 
 #[doc(hidden)]
 pub use concurrency::{JoinFuture, MergeFutureStream, MergeStream};
 pub use io::Async;
-use slab::Slab;
+use reactor::{Notifier, REACTOR};
 
 // Option<Id> will be same size as `usize`
 #[repr(transparent)]
@@ -172,6 +171,7 @@ where
 
 #[derive(Debug)]
 struct WakeQueue {
+    base_waker: AtomicWaker,
     local_thread: ThreadId,
     local: UnsafeCell<VecDeque<usize>>,
     concurrent: ConcurrentQueue<usize>,
@@ -185,6 +185,7 @@ unsafe impl Sync for WakeQueue {}
 impl WakeQueue {
     fn with_capacity(capacity: usize) -> Self {
         Self {
+            base_waker: AtomicWaker::new(),
             local_thread: thread::current().id(),
             local: UnsafeCell::new(VecDeque::with_capacity(capacity)),
             concurrent: ConcurrentQueue::unbounded(),
@@ -245,7 +246,6 @@ impl WakeQueue {
 
 struct TaskWaker {
     queue: Arc<WakeQueue>,
-    waker: AtomicWaker,
     awoken: AtomicBool,
     task_id: usize,
 }
@@ -260,17 +260,16 @@ impl Wake for TaskWaker {
             .is_ok()
         {
             self.queue.push(self.task_id);
+            // Release memory ordering
+            self.queue.base_waker.wake();
         }
-        self.waker.wake();
     }
 }
 
 impl TaskWaker {
     fn new(queue: Arc<WakeQueue>, task_id: usize) -> Self {
         Self {
-            waker: AtomicWaker::new(),
-            // Initialize the flag to true so that the future gets polled the first time
-            awoken: AtomicBool::new(true),
+            awoken: AtomicBool::new(false),
             queue,
             task_id,
         }
@@ -282,9 +281,8 @@ impl TaskWaker {
         (this, waker)
     }
 
-    fn register(&self, waker: &Waker) {
-        self.waker.register(waker);
-        self.awoken.store(false, Ordering::Release);
+    fn to_sleep(&self) {
+        self.awoken.store(false, Ordering::Relaxed);
     }
 }
 
@@ -300,9 +298,10 @@ struct Task<'a> {
 }
 
 impl<'a> Task<'a> {
-    fn poll(&mut self, base_waker: &Waker) -> Poll<()> {
+    fn poll(&mut self) -> Poll<()> {
         let (waker_data, waker) = &self.waker_pair;
-        waker_data.register(base_waker);
+        // Reset this waker so that it can produce wakeups again
+        waker_data.to_sleep();
         self.future.as_mut().poll(&mut Context::from_waker(waker))
     }
 
@@ -474,8 +473,13 @@ impl<'a> Executor<'a> {
         self.spawn(f(cl))
     }
 
+    fn register_base_waker(&self, base_waker: &Waker) {
+        // Acquire ordering
+        self.wake_queue.base_waker.register(base_waker);
+    }
+
     // Poll tasks that have been awoken, returning whether the main future has been awoken
-    fn poll_tasks(&self, base_waker: &Waker) -> bool {
+    fn poll_tasks(&self) -> bool {
         let mut main_task_awoken = false;
         let mut tasks = self.tasks.borrow_mut();
 
@@ -486,7 +490,7 @@ impl<'a> Executor<'a> {
             // For each awoken task, find it if it still exists
             else if let Some(task) = tasks.get_mut(task_id) {
                 // If a task is cancelled, don't poll it, just remove it
-                if task.handle_data.cancelled.get() || task.poll(base_waker).is_ready() {
+                if task.handle_data.cancelled.get() || task.poll().is_ready() {
                     tasks.remove(task_id);
                 }
             }
@@ -496,7 +500,7 @@ impl<'a> Executor<'a> {
     }
 
     // Poll newly spawned tasks and move them to the task list
-    fn poll_spawned(&self, base_waker: &Waker) {
+    fn poll_spawned(&self) {
         let mut tasks = self.tasks.borrow_mut();
         // Keep checking newly spawned tasks until there's no more left.
         // Reborrow the spawned tasks on every iteration, because the tasks themselves also need to
@@ -517,7 +521,7 @@ impl<'a> Executor<'a> {
             let waker_pair = TaskWaker::waker_pair(self.wake_queue.clone(), task_id);
             let mut task = Task::from_spawned(spawned_task, waker_pair);
             // Only insert the task if it returns pending
-            if task.poll(base_waker).is_pending() {
+            if task.poll().is_pending() {
                 next_vacancy.insert(task);
             }
         }
@@ -580,14 +584,15 @@ impl<'a> Executor<'a> {
         self.wake_queue.reset(MAIN_TASK_ID);
 
         let out = poll_fn(move |cx| {
-            let main_task_awoken = self.poll_tasks(cx.waker());
+            self.register_base_waker(cx.waker());
+            let main_task_awoken = self.poll_tasks();
             if main_task_awoken {
-                main_waker_data.register(cx.waker());
+                main_waker_data.to_sleep();
                 if let Poll::Ready(out) = fut.as_mut().poll(&mut Context::from_waker(&main_waker)) {
                     return Poll::Ready(out);
                 }
             }
-            self.poll_spawned(cx.waker());
+            self.poll_spawned();
             Poll::Pending
         })
         .await;
@@ -684,37 +689,37 @@ impl<T> Future for TaskHandle<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::future::pending;
+    use std::{future::pending, time::Duration};
 
-    use crate::test::MockWaker;
+    use crate::{test::MockWaker, time::sleep};
 
     use super::*;
 
     #[test]
     fn spawn_and_poll() {
-        let waker = Arc::new(MockWaker::default());
         let ex = Executor::new();
         assert_eq!(ex.tasks.borrow().len(), 0);
 
         ex.spawn(pending::<()>());
         ex.spawn(pending::<()>());
         ex.spawn(pending::<()>());
-        ex.poll_tasks(&waker.clone().into());
-        ex.poll_spawned(&waker.clone().into());
+        ex.poll_tasks();
+        ex.poll_spawned();
         assert_eq!(ex.tasks.borrow().len(), 3);
 
         ex.spawn(async {});
         ex.spawn(async {});
-        ex.poll_tasks(&waker.clone().into());
-        ex.poll_spawned(&waker.clone().into());
+        ex.poll_tasks();
+        ex.poll_spawned();
         assert_eq!(ex.tasks.borrow().len(), 3);
     }
 
     #[test]
     fn task_waker() {
-        let waker = Arc::new(MockWaker::default());
+        let base_waker = Arc::new(MockWaker::default());
         let mut n = 0;
         let ex = Executor::new();
+        ex.register_base_waker(&base_waker.clone().into());
         ex.spawn(poll_fn(|cx| {
             n += 1;
             cx.waker().wake_by_ref();
@@ -722,10 +727,11 @@ mod tests {
         }));
 
         // Poll the spawned tasks, which should wake up right away
-        ex.poll_spawned(&waker.clone().into());
+        ex.poll_spawned();
         assert_eq!(unsafe { (*ex.wake_queue.local.get()).len() }, 1);
+        assert!(base_waker.get());
         // Poll the awoken task, which should wake up again
-        ex.poll_tasks(&waker.clone().into());
+        ex.poll_tasks();
         assert_eq!(unsafe { (*ex.wake_queue.local.get()).len() }, 1);
 
         drop(ex);
@@ -735,7 +741,6 @@ mod tests {
 
     #[test]
     fn cancel() {
-        let waker = Arc::new(MockWaker::default());
         let ex = Executor::new();
         assert_eq!(ex.tasks.borrow().len(), 0);
 
@@ -743,20 +748,20 @@ mod tests {
         // Cancel task while it's in the spawned list
         task.cancel();
         assert!(task.is_cancelled());
-        ex.poll_tasks(&waker.clone().into());
-        ex.poll_spawned(&waker.clone().into());
+        ex.poll_tasks();
+        ex.poll_spawned();
         assert_eq!(ex.tasks.borrow().len(), 0);
 
         let task = ex.spawn(pending::<()>());
         assert!(!task.is_cancelled());
-        ex.poll_tasks(&waker.clone().into());
-        ex.poll_spawned(&waker.clone().into());
+        ex.poll_tasks();
+        ex.poll_spawned();
         assert_eq!(ex.tasks.borrow().len(), 1);
 
         // Cancel task while it's in the task list
         task.cancel();
-        ex.poll_tasks(&waker.clone().into());
-        ex.poll_spawned(&waker.clone().into());
+        ex.poll_tasks();
+        ex.poll_spawned();
         assert_eq!(ex.tasks.borrow().len(), 0);
     }
 
@@ -787,5 +792,40 @@ mod tests {
         assert_eq!(queue.concurrent.len(), 0);
         assert_eq!(unsafe { (*queue.local.get()).len() }, 1);
         queue.drain_for_each(|e| assert_eq!(e, 6));
+    }
+
+    #[test]
+    fn switch_waker() {
+        let ex = Executor::new();
+        let waker1 = Arc::new(MockWaker::default());
+        let waker2 = Arc::new(MockWaker::default());
+
+        let mut fut = pin!(ex.run(async {
+            let _bg = ex.spawn(sleep(Duration::from_millis(100)));
+            sleep(Duration::from_millis(50)).await;
+            // Have the future wait forever without polling the background task
+            pending::<()>().await;
+        }));
+
+        // Poll future with waker1
+        assert!(fut
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker1.clone().into()))
+            .is_pending());
+        // Wait until the 50ms sleep is done then invoke the reactor, which should notify waker1
+        thread::sleep(Duration::from_millis(50));
+        REACTOR.with(|r| r.wait()).unwrap();
+        assert!(waker1.get());
+
+        // Poll future with waker2
+        assert!(fut
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker2.clone().into()))
+            .is_pending());
+        // Wait until the 100ms sleep is done then invoke the reactor, which should notify waker2
+        // even though the sleep task is never polled after switching to waker2
+        thread::sleep(Duration::from_millis(50));
+        REACTOR.with(|r| r.wait()).unwrap();
+        assert!(waker2.get());
     }
 }
