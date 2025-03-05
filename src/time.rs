@@ -84,6 +84,7 @@ impl TimerQueue {
     }
 
     pub(crate) fn clear_expired(&mut self) {
+        let prev = self.timers.len();
         let now = Instant::now();
         // Remove all expired timer entries and invoke their wakers
         while let Some(entry) = self.timers.first_entry() {
@@ -93,6 +94,10 @@ impl TimerQueue {
             } else {
                 break;
             }
+        }
+        let diff = prev - self.timers.len();
+        if diff > 0 {
+            log::trace!("Cleared {diff} timers");
         }
     }
 
