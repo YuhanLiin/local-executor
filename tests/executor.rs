@@ -3,6 +3,7 @@ use std::{
     future::pending,
     net::{TcpListener, TcpStream},
     rc::Rc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -215,4 +216,34 @@ fn client_server() {
     });
 
     client.join().unwrap();
+}
+
+#[test]
+fn notify_from_other_thread() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Trace)
+        .try_init();
+
+    let (send, recv) = flume::bounded(0);
+    let th = thread::spawn(move || {
+        send.send(Duration::from_millis(20)).unwrap();
+        send.send(Duration::from_millis(80)).unwrap();
+        send.send(Duration::from_millis(80)).unwrap();
+    });
+
+    let start = Instant::now();
+    let ex = Executor::new();
+    ex.block_on(async {
+        let t1 = ex.spawn(sleep(recv.recv_async().await.unwrap()));
+        let t2 = ex.spawn(sleep(recv.recv_async().await.unwrap()));
+        let t3 = ex.spawn(sleep(recv.recv_async().await.unwrap()));
+        t1.await;
+        t2.await;
+        t3.await;
+    });
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(80));
+    assert!(elapsed < Duration::from_millis(100));
+    th.join().unwrap();
 }
