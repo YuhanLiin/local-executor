@@ -718,6 +718,9 @@ mod tests {
         ex.register_base_waker(&base_waker.clone().into());
         ex.spawn(poll_fn(|cx| {
             n += 1;
+            // Spurious wakes should not push extra elements into wake_queue
+            cx.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
             cx.waker().wake_by_ref();
             Poll::<()>::Pending
         }));
