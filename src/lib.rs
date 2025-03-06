@@ -811,16 +811,15 @@ mod tests {
             pending::<()>().await;
         }));
 
-        let now = Instant::now();
         // Poll future with waker1
         assert!(fut
             .as_mut()
             .poll(&mut Context::from_waker(&waker1.clone().into()))
             .is_pending());
-        println!("{} ms to wakeup", now.elapsed().as_millis());
+        let now = Instant::now();
         // Wait until the 50ms sleep is done then invoke the reactor, which should notify waker1
         thread::sleep(Duration::from_millis(50));
-        println!("{} ms to wakeup", now.elapsed().as_millis());
+        log::info!("{} ms to wakeup", now.elapsed().as_millis());
         REACTOR.with(|r| r.wait()).unwrap();
         assert!(waker1.get());
 
